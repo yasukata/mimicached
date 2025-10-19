@@ -2,7 +2,7 @@
 
 mimicached is a cache server that mimics the behavior of memcached.
 
-mimicached achieves high performance by leveraging a performance-optimized portable TCP/IP stack called [iip](https://github.com/yasukata/iip) and by using [a multi-core scalable hash table implementation](https://github.com/yasukata/mimicached/blob/master/kv.c). Along with this, [a version that uses the standard kernel TCP/IP stack](#mimicached-with-the-kernel-tcpip-stack) is also available.
+mimicached achieves [high performance](#rough-performance-numbers) by leveraging a performance-optimized portable TCP/IP stack called [iip](https://github.com/yasukata/iip) and by using [a multi-core scalable hash table implementation](https://github.com/yasukata/mimicached/blob/master/kv.c). Along with this, [a version that uses the standard kernel TCP/IP stack](#mimicached-with-the-kernel-tcpip-stack) is also available.
 
 **WARNING: The authors will not bear any responsibility if the implementations, provided by the authors, cause any problems.**
 
@@ -2193,3 +2193,64 @@ The following is the command options.
 - ```-w```: the ratio of the set command.
 - ```-x```: if this option is specified, this benchmark program bypasses the memcached protocol parser and directly executes the key-value operation.
 - ```-z```: the hash table size.
+
+## rough performance numbers
+
+### benchmark enviornment
+
+The benchmarks are run on two identical machines, and each of the two machines installs the following.
+
+- CPU: Two of 16-core Intel(R) Xeon(R) Gold 6326 CPU @ 2.90GHz (32 cores in total)
+- NIC: Mellanox ConnectX-5 100 Gbps NIC (the NICs of the two machines are directly connected via a cable)
+- DRAM: DDR4-3200 128 GB
+- OS: Linux 6.8
+
+### networked benchmark
+
+This benchmark runs either the original memcached server version 1.6.39 or [mimicached built with iip](#build) on one of the two machines, and the benchmark client shown [above](#network-benchmark-client) on the other machine.
+
+The servers use 1, 2, 4, 8, 16, or 32 CPU cores, and the client always uses 32 CPU cores.
+
+We apply the following workload configuration on the client.
+
+- set 10% get 90%
+- approximated zipfian distribution
+- 1 million key-value items
+- key size is 8 bytes
+- value size is 8 bytes
+- text protocol
+
+<details>
+<summary>please click here to show the command details</summary>
+
+mimicached server: the number of CPU cores of the servers: 1, 2, 4, 8, 16, or 32, and to change the number of CPU cores used, ```-l 0```, ```-l 0-1```, ```-l 0-3```, ```-l 0-7```, ```-l 0-15```, and ```-l 0-31``` for 1, 2, 4, 8, 16, and 32 CPU core cases, respectively; the following is the 1 CPU core case.
+
+```
+sudo LD_LIBRARY_PATH=./iip-dpdk/dpdk/install/lib/x86_64-linux-gnu ./a.out -n 2 -l 0 --proc-type=primary --file-prefix=pmd1 --allow 17:00.0 -- -a 0,10.100.0.20 -- -m 16384 -z 100000000
+```
+
+The original memcached server version 1.6.39: to change the number of CPU cores used, ```-t 1```, ```-t 2```, ```-t 4```, ```-t 8 ```, ```-t 16```, and ```-t 32``` for 1, 2, 4, 8, 16, and 32 CPU core cases, respectively; the following is the 1 CPU core case.
+
+```
+./memcached -m 16384 -t 1
+```
+
+client program shown [above](#network-benchmark-client): this client changes the number of concurrent TCP connections established with the servers by specifying ```-c 1```, ```-c 2```, ```-c 4```, ```-c 8```, ```-c 16```, and ```-c 32``` for 1, 2, 4, 8, 16, and 32 CPU core cases, respectively, so that each thread of a server process will handle 32 concurrent TCP connections; the following is the 1 CPU core case.
+
+```
+sudo LD_LIBRARY_PATH=../iip-dpdk/dpdk/install/lib/x86_64-linux-gnu ./a.out -n 2 -l 0-31 --proc-type=primary --file-prefix=pmd1 --allow 17:00.0 -- -a 0,10.100.0.10 -- -s 10.100.0.20 -p 11211 -m "```echo -e "version\r\n\0"```" -c 1 -- -k 8 -v 8 -n 1000000 -w 10 -d -l
+```
+
+</details>
+
+The following table shows the requests per second results for the original memcached server implementation and mimicached. Note that the numbers for the original memcached server is for reference purposes; the comparison between the two implementations having different features is not fair.
+
+| CPU cores | memcached | mimicached |
+| --- | --- | --- |
+|  1 |  202487 |  1201418 |
+|  2 |  392694 |  2041757 |
+|  4 |  718106 |  3915976 |
+|  8 | 1378252 |  7650862 |
+| 16 | 2344839 | 14625274 |
+| 32 | 3192569 | 23194445 |
+
