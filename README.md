@@ -393,9 +393,9 @@ static void *server_thread(void *data)
 									if (mc->cur) {
 										ssize_t tx = send(mc->fd, mc->txbuf, mc->cur, MSG_NOSIGNAL);
 										if (tx != (ssize_t) mc->cur) {
-										close(mc->fd);
-										free(mc);
-										break;
+											close(mc->fd);
+											free(mc);
+											break;
 										}
 										mc->cur = 0;
 									}
@@ -425,10 +425,7 @@ static void *server_thread(void *data)
 int main(int argc, char *const *argv)
 {
 	unsigned short port = 11211, num_cores = 1, core_list[MAX_CORE];
-	{
-		kv_init();
-		slab_init();
-	}
+	slab_init();
 	slab_stat.mem_size = 2 * 1048576;
 	{
 		int ch;
@@ -484,7 +481,7 @@ int main(int argc, char *const *argv)
 									{
 										uint16_t j, k;
 										for (j = 0, k = from; k <= to; j++, k++)
-										core_list[j] = k;
+											core_list[j] = k;
 										num_cores = j;
 									}
 								}
@@ -502,7 +499,7 @@ int main(int argc, char *const *argv)
 									if (i == strlen(optarg) || m[i] == ',') {
 										m[i] = '\0';
 										if (j != i)
-										core_list[k++] = atoi(&m[j]);
+											core_list[k++] = atoi(&m[j]);
 										j = i + 1;
 									}
 									if (i == strlen(optarg))
@@ -535,6 +532,7 @@ int main(int argc, char *const *argv)
 			}
 		}
 	}
+	kv_init();
 	{
 		int fd;
 		assert((fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) != -1);
