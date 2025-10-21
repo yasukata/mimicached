@@ -1066,7 +1066,7 @@ static void send_set_request(uint64_t req_id, void *mem, void *handle, void *opa
 }
 
 static void iip_ops_tcp_payload(void *mem, void *handle, void *m,
-				void *tcp_opaque __attribute__((unused)), uint16_t head_off, uint16_t tail_off,
+				void *tcp_opaque, uint16_t head_off, uint16_t tail_off,
 				void *opaque)
 {
 	void **opaque_array = (void **) opaque;
@@ -1079,6 +1079,11 @@ static void iip_ops_tcp_payload(void *mem, void *handle, void *m,
 	mcn[port]->rxbuf[mcn[port]->len] = '\0';
 	td->monitor.counter[td->monitor.idx].rx_bytes += PB_TCP_PAYLOAD_LEN(m) - head_off - tail_off;
 	td->monitor.counter[td->monitor.idx].rx_pkt += 1;
+	{
+		uint64_t now = BENCH_IIP_NOW(opaque);
+		td->monitor.latency.val[td->monitor.latency.cnt++ % NUM_MONITOR_LATENCY_RECORD] = now - ((struct tcp_opaque *) tcp_opaque)->monitor.ts;
+		((struct tcp_opaque *) tcp_opaque)->monitor.ts = now;
+	}
 	while (mcn[port]->len) {
 		char found_error = 0;
 		if (mcn[port]->req_type == 2) {
