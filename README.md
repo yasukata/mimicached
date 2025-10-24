@@ -2060,16 +2060,16 @@ int main(int argc, char *const *argv)
 		{
 			uint64_t i;
 			for (i = 0, zipf_zetan = 0; i < num_pairs; i++)
-				zipf_zetan += pow((double) 1.0 / (double) num_pairs, zipf_theta);
+				zipf_zetan += 1 / pow(1 + i, zipf_theta);
 		}
 		{
 			double zipf_zeta2 = 0;
 			{
 				uint64_t i;
 				for (i = 0; i < 2; i++)
-					zipf_zeta2 += pow((double) 1.0 / (double) num_pairs, zipf_theta);
+					zipf_zeta2 += 1 / pow(i + 1, zipf_theta);
 			}
-			zipf_eta = (1 - pow(2.0 / (double) num_pairs, 1 - zipf_theta) / (1 - zipf_zeta2) / zipf_zetan);
+			zipf_eta = (1 - pow(2.0 / (double) num_pairs, 1 - zipf_theta)) / (1 - zipf_zeta2 / zipf_zetan);
 		}
 		printf("zipfian distribution\n");
 	} else
