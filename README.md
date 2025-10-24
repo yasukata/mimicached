@@ -1560,6 +1560,10 @@ Then, please save the following program as a file named ```main.c```.
 
 #include <pthread.h>
 
+#include <numa.h>
+#define mem_alloc_local	numa_alloc_local
+#define mem_free	numa_free
+
 #define mp_assert assert
 #define mp_memcmp memcmp
 #define mp_memcpy memcpy
@@ -1630,9 +1634,8 @@ struct thread_data {
 	void *gc_key_list;
 	void *gc_val_list;
 	pthread_t th;
-	uint32_t core;
+	uint32_t core_id;
 	uint32_t num_cores;
-	uint32_t thread_id;
 	char rxbuf[INPUT_RING_SIZE][(1UL << 21)];
 	uint32_t tx_cur;
 	char txbuf[(1UL << 21)];
@@ -1650,15 +1653,15 @@ struct thread_data {
 		char bypass_parser;
 		char zipfian;
 		uint64_t random;
-		uint32_t *wait;
 		uint64_t num_pairs;
 		uint16_t key_len;
 		uint32_t val_len;
 		uint8_t write_ratio;
-		uint64_t *set_req_len;
-		uint64_t *get_req_len;
-		char **set_req;
-		char **get_req;
+		char key_base[256];
+		uint64_t set_req_len;
+		uint64_t get_req_len;
+		char *set_req_base;
+		char *get_req_base;
 	} workload;
 };
 
@@ -1676,8 +1679,6 @@ static void sig_h(int s __attribute__((unused)))
 	should_stop = 1;
 	signal(SIGINT, SIG_DFL);
 }
-
-static uint8_t cnt_idx = 0;
 
 static void mp_ops_clear_response(void *opaque)
 {
@@ -1699,15 +1700,60 @@ static long mp_ops_push_response(void *opaque, const char *msg, size_t len)
 	}
 }
 
+static char _dist_zipfian, _bypass_parser;
 static double zipf_alpha, zipf_zetan, zipf_eta, zipf_theta;
+static uint64_t _num_pairs;
+static uint32_t _key_len, _val_len, _write_ratio, _num_cores;
+static _Atomic uint8_t cnt_idx;
+static _Atomic uint32_t wait_cnt;
+			
+static struct thread_data *tds[MAX_CORE];
 
 static void *server_thread(void *data)
 {
-	struct thread_data *td = (struct thread_data *) data;
+	struct thread_data *td = mem_alloc_local(sizeof(struct thread_data));
+	assert(td);
+	memset(td, 0, sizeof(sizeof(struct thread_data)));
+	td->core_id = (uint32_t)(uintptr_t) data;
+	td->num_cores = _num_cores;
+	td->workload.bypass_parser = _bypass_parser;
+	td->workload.zipfian = _dist_zipfian;
+	td->workload.random = 88172645463325252UL * (td->core_id + 1);
+	td->workload.num_pairs = _num_pairs;
+	td->workload.key_len = _key_len;
+	td->workload.val_len = _val_len;
+	td->workload.write_ratio = _write_ratio;
+	{
+		char _set[2048], set[4096];
+		snprintf(_set, sizeof(_set), "set %%0%dx 0 0 %u\r\n", td->workload.key_len, td->workload.val_len);
+		snprintf(set, sizeof(set), _set, 0, td->workload.val_len);
+		td->workload.set_req_len = strlen(set);
+		td->workload.set_req_base = (char *) mem_alloc_local(td->workload.set_req_len);
+		memcpy(td->workload.set_req_base, set, td->workload.set_req_len);
+	}
+	{
+		char _get[2048], get[4096];
+		snprintf(_get, sizeof(_get), "get %%0%dx\r\n", td->workload.key_len);
+		snprintf(get, sizeof(get), _get, 0);
+		td->workload.get_req_len = strlen(get);
+		td->workload.get_req_base = (char *) mem_alloc_local(td->workload.get_req_len);
+		memcpy(td->workload.get_req_base, get, td->workload.get_req_len);
+	}
+	snprintf(td->workload.key_base, sizeof(td->workload.key_base), "%%0%dx", td->workload.key_len);
+	MPR_RING_NUM_SLOT(td->mpr) = INPUT_RING_SIZE;
+	MPR_RING_HEAD_IDX(td->mpr) = 0;
+	MPR_RING_HEAD_OFF(td->mpr) = 0;
+	MPR_RING_TAIL_IDX(td->mpr) = 0;
+	MPR_RING_TAIL_OFF(td->mpr) = 0;
+	{
+		int j;
+		for (j = 0; j < INPUT_RING_SIZE; j++)
+			MPR_SLOT_PTR(td->mpr, j) = (uint64_t) td->rxbuf[j];
+	}
 	{
 		cpu_set_t c;
 		CPU_ZERO(&c);
-		CPU_SET(td->core, &c);
+		CPU_SET(td->core_id, &c);
 		pthread_setaffinity_np(pthread_self(), sizeof(c), &c);
 	}
 	memset(td->rxbuf[1], 'A', sizeof(td->rxbuf[1]));
@@ -1715,14 +1761,19 @@ static void *server_thread(void *data)
 	memcpy(td->rxbuf[2], "\r\n", 2);
 	MPR_SLOT_LEN(td->mpr, 2) = 2;
 	asm volatile ("" ::: "memory");
-	kv_register_ktd(&td->ktd, td->core);
-	printf("core %u loads %lu entries\n", td->core, td->workload.num_pairs / td->num_cores);
+	kv_register_ktd(&td->ktd, td->core_id);
+	printf("core %u loads %lu entries\n", td->core_id, td->workload.num_pairs / td->num_cores);
 	{
 		uint64_t i;
 		for (i = 0; i < (td->workload.num_pairs / td->num_cores) && !should_stop; i++) {
 			if (!td->workload.bypass_parser) {
-				MPR_SLOT_PTR(td->mpr, 0) = (uint64_t) td->workload.set_req[(td->workload.num_pairs / td->num_cores) * td->thread_id + i];
-				MPR_SLOT_LEN(td->mpr, 0) = td->workload.set_req_len[(td->workload.num_pairs / td->num_cores) * td->thread_id + i];
+				memcpy((void *) MPR_SLOT_PTR(td->mpr, 0), td->workload.set_req_base, td->workload.set_req_len);
+				{
+					char key[250];
+					snprintf(key, sizeof(key), td->workload.key_base, (td->workload.num_pairs / td->num_cores) * td->core_id + i);
+					memcpy((void *) MPR_SLOT_PTR(td->mpr, 0) + 4, key, td->workload.key_len);
+				}
+				MPR_SLOT_LEN(td->mpr, 0) = td->workload.set_req_len;
 				MPR_RING_HEAD_IDX(td->mpr) = 0;
 				MPR_RING_HEAD_OFF(td->mpr) = 0;
 				MPR_RING_TAIL_IDX(td->mpr) = 3;
@@ -1763,11 +1814,15 @@ static void *server_thread(void *data)
 				td->tx_cur = 0;
 				td->txbuf[0] = '\0';
 				td->stat.set_cnt[cnt_idx]++;
-				MP_OPS_KV_CMD(td->mpr,
-						(const uint8_t *) &((td->workload.set_req[(td->workload.num_pairs / td->num_cores) * td->thread_id + i])[4]),
-						td->workload.key_len,
-						cmd,
-						(void *) td);
+				{
+					char key[250];
+					snprintf(key, sizeof(key), td->workload.key_base, (td->workload.num_pairs / td->num_cores) * td->core_id + i);
+					MP_OPS_KV_CMD(td->mpr,
+							(uint8_t *) key,
+							td->workload.key_len,
+							cmd,
+							(void *) td);
+				}
 				if (!(MP_KV_CMD_OPFLAGS(cmd) & MC_KV_CMD_OPFLAG_VIVIFY_ON_MISS))
 					td->stat.stored_cnt[cnt_idx]++;
 				else {
@@ -1782,16 +1837,17 @@ static void *server_thread(void *data)
 	}
 	{
 		uint32_t i = 1;
-		(void) SLAB_OPS_ATOMIC_ADD_FETCH(td->workload.wait, i, SLAB_FLAG_ATOMIC_RELEASE);
+		(void) SLAB_OPS_ATOMIC_ADD_FETCH(&wait_cnt, i, SLAB_FLAG_ATOMIC_RELEASE);
 	}
 	while (!should_stop) {
 		uint32_t wait;
-		KV_OPS_ATOMIC_LOAD(td->workload.wait, &wait, KV_FLAG_ATOMIC_ACQUIRE);
+		KV_OPS_ATOMIC_LOAD(&wait_cnt, &wait, KV_FLAG_ATOMIC_ACQUIRE);
 		if (wait == td->num_cores)
 			break;
 		usleep(100);
 	}
-	printf("core %u start benchmarking\n", td->core);
+	tds[td->core_id] = td;
+	printf("core %u start benchmarking\n", td->core_id);
 	while (!should_stop) {
 		uint64_t req_id;
 		RANDOM_XORSHIFT64(td->workload.random);
@@ -1810,8 +1866,13 @@ static void *server_thread(void *data)
 		if (!td->workload.bypass_parser) {
 			RANDOM_XORSHIFT64(td->workload.random);
 			if ((td->workload.random % 100) < td->workload.write_ratio) {
-				MPR_SLOT_PTR(td->mpr, 0) = (uint64_t) td->workload.set_req[req_id];
-				MPR_SLOT_LEN(td->mpr, 0) = td->workload.set_req_len[req_id];
+				memcpy((void *) MPR_SLOT_PTR(td->mpr, 0), td->workload.set_req_base, td->workload.set_req_len);
+				{
+					char key[250];
+					snprintf(key, sizeof(key), td->workload.key_base, req_id);
+					memcpy((void *) MPR_SLOT_PTR(td->mpr, 0) + 4, key, td->workload.key_len);
+				}
+				MPR_SLOT_LEN(td->mpr, 0) = td->workload.set_req_len;
 				MPR_RING_HEAD_IDX(td->mpr) = 0;
 				MPR_RING_HEAD_OFF(td->mpr) = 0;
 				MPR_RING_TAIL_IDX(td->mpr) = 3;
@@ -1819,8 +1880,13 @@ static void *server_thread(void *data)
 				td->workload.tmp_opt = 1;
 				td->stat.set_cnt[cnt_idx]++;
 			} else {
-				MPR_SLOT_PTR(td->mpr, 0) = (uint64_t) td->workload.get_req[req_id];
-				MPR_SLOT_LEN(td->mpr, 0) = td->workload.get_req_len[req_id];
+				memcpy((void *) MPR_SLOT_PTR(td->mpr, 0), td->workload.get_req_base, td->workload.get_req_len);
+				{
+					char key[250];
+					snprintf(key, sizeof(key), td->workload.key_base, req_id);
+					memcpy((void *) MPR_SLOT_PTR(td->mpr, 0) + 4, key, td->workload.key_len);
+				}
+				MPR_SLOT_LEN(td->mpr, 0) = td->workload.get_req_len;
 				MPR_RING_HEAD_IDX(td->mpr) = 0;
 				MPR_RING_HEAD_OFF(td->mpr) = 0;
 				MPR_RING_TAIL_IDX(td->mpr) = 1;
@@ -1874,11 +1940,15 @@ static void *server_thread(void *data)
 				td->workload.tmp_opt = 0;
 				td->stat.get_cnt[cnt_idx]++;
 			}
-			MP_OPS_KV_CMD(td->mpr,
-					(const uint8_t *) &((td->workload.set_req[req_id])[4]),
-					td->workload.key_len,
-					cmd,
-					(void *) td);
+			{
+				char key[250];
+				snprintf(key, sizeof(key), td->workload.key_base, req_id);
+				MP_OPS_KV_CMD(td->mpr,
+						(uint8_t *) key,
+						td->workload.key_len,
+						cmd,
+						(void *) td);
+			}
 			if (td->workload.tmp_opt) {
 				if (!(MP_KV_CMD_OPFLAGS(cmd) & MC_KV_CMD_OPFLAG_UPDATE))
 					td->stat.stored_cnt[cnt_idx]++;
@@ -1893,19 +1963,26 @@ static void *server_thread(void *data)
 		}
 		kv_garbage_collection((void *) td);
 	}
-	printf("core %u returns\n", td->core);
+	printf("core %u returns\n", td->core_id);
 	pthread_exit(NULL);
 }
 
 int main(int argc, char *const *argv)
 {
-	unsigned short num_cores = 0, core_list[MAX_CORE];
-	char bypass_parser = 0, zipfian = 0;
-	uint64_t num_pairs = 128;
-	uint16_t key_len = 32;
-	uint32_t val_len = 256;
-	uint16_t write_ratio = 0;
-	zipf_theta = 0.9;
+	unsigned short core_list[MAX_CORE];
+	{
+		_num_cores = 0;
+		_bypass_parser = 0;
+		zipf_theta = 0.9;
+		cnt_idx = 0;
+		_dist_zipfian = 0;
+		_num_pairs = 1;
+		_key_len = 32;
+		_val_len = 32;
+		_write_ratio = 0;
+		memset(tds, 0, sizeof(tds));
+		wait_cnt = 0;
+	}
 	slab_init(); /* TODO: better init */
 	slab_stat.mem_size = 2 * 1048576;
 	{
@@ -1950,7 +2027,7 @@ int main(int argc, char *const *argv)
 										uint16_t j, k;
 										for (j = 0, k = from; k <= to; j++, k++)
 										core_list[j] = k;
-										num_cores = j;
+										_num_cores = j;
 									}
 								}
 							}
@@ -1974,36 +2051,36 @@ int main(int argc, char *const *argv)
 										break;
 								}
 								assert(k);
-								num_cores = k;
+								_num_cores = k;
 							}
 							free(m);
 						}
 					} else {
 						core_list[0] = atoi(optarg);
-						num_cores = 1;
+						_num_cores = 1;
 					}
 				}
 				break;
 			case 'd':
-				zipfian = 1;
+				_dist_zipfian = 1;
 				break;
 			case 'k':
-				key_len = atoi(optarg);
+				_key_len = atoi(optarg);
 				break;
 			case 'n':
-				num_pairs = atoi(optarg);
+				_num_pairs = atoi(optarg);
 				break;
 			case 'm':
 				slab_stat.mem_size = atol(optarg) * 1048576;
 				break;
 			case 'v':
-				val_len = atoi(optarg);
+				_val_len = atoi(optarg);
 				break;
 			case 'w':
-				write_ratio = atoi(optarg);
+				_write_ratio = atoi(optarg);
 				break;
 			case 'x':
-				bypass_parser = 1;
+				_bypass_parser = 1;
 				break;
 			case 'z':
 				kv_conf_hash_table_cnt = atoi(optarg);
@@ -2015,26 +2092,26 @@ int main(int argc, char *const *argv)
 		}
 	}
 	{
-		assert(num_cores > 0);
-		assert(num_pairs > 0);
+		assert(_num_cores > 0);
+		assert(_num_pairs > 0);
 		assert(kv_conf_hash_table_cnt > 0);
-		assert(key_len <= 250);
-		assert(val_len <= (1UL << 20));
-		assert(write_ratio <= 100);
+		assert(_key_len <= 250);
+		assert(_val_len <= (1UL << 20));
+		assert(_write_ratio <= 100);
 	}
 	printf("%lu pairs, key %u bytes, val %u bytes, set %u%% get %u%%\n",
-			num_pairs, key_len, val_len, write_ratio, 100 - write_ratio);
+			_num_pairs, _key_len, _val_len, _write_ratio, 100 - _write_ratio);
 	{
 		char tmp[512];
-		snprintf(tmp, sizeof(tmp), "%%0%dx", key_len);
+		snprintf(tmp, sizeof(tmp), "%%0%dx", _key_len);
 		{
 			char keymin[512], keymax[512];
 			snprintf(keymin, sizeof(keymin), tmp, 0);
-			snprintf(keymax, sizeof(keymax), tmp, num_pairs);
+			snprintf(keymax, sizeof(keymax), tmp, _num_pairs);
 			printf("key: min %s max %s\n", keymin, keymax);
 		}
 	}
-	printf("protocol parser is %sbypassed\n", bypass_parser ? "" : "NOT ");
+	printf("protocol parser is %sbypassed\n", _bypass_parser ? "" : "NOT ");
 	printf("hash table size %lu, memory size ", kv_conf_hash_table_cnt);
 	{
 		uint64_t s = kv_conf_hash_table_cnt * sizeof(void *);
@@ -2048,7 +2125,7 @@ int main(int argc, char *const *argv)
 			printf("%lu.%03lu GB\n", s / 1000000000, (s % 1000000000) / 1000000);
 	}
 	kv_init(); /* TODO: better init */
-	if (zipfian) { /* zipfian preparation */
+	if (_dist_zipfian) { /* zipfian preparation */
 		/*
 		 * Jim Gray et al, "Quickly Generating Billion-Record Synthetic Databases", SIGMOD 1994
 		 *
@@ -2059,7 +2136,7 @@ int main(int argc, char *const *argv)
 		zipf_alpha = 1 / (1 - zipf_theta);
 		{
 			uint64_t i;
-			for (i = 0, zipf_zetan = 0; i < num_pairs; i++)
+			for (i = 0, zipf_zetan = 0; i < _num_pairs; i++)
 				zipf_zetan += 1 / pow(1 + i, zipf_theta);
 		}
 		{
@@ -2069,143 +2146,51 @@ int main(int argc, char *const *argv)
 				for (i = 0; i < 2; i++)
 					zipf_zeta2 += 1 / pow(i + 1, zipf_theta);
 			}
-			zipf_eta = (1 - pow(2.0 / (double) num_pairs, 1 - zipf_theta)) / (1 - zipf_zeta2 / zipf_zetan);
+			zipf_eta = (1 - pow(2.0 / (double) _num_pairs, 1 - zipf_theta)) / (1 - zipf_zeta2 / zipf_zetan);
 		}
 		printf("zipfian distribution\n");
 	} else
 		printf("uniform distribution\n");
 	signal(SIGINT, sig_h);
 	{
-		uint64_t *set_req_len = (uint64_t *) calloc(num_pairs, sizeof(uint64_t));
-		uint64_t *get_req_len = (uint64_t *) calloc(num_pairs, sizeof(uint64_t));
-		char **set_req = (char **) calloc(num_pairs, sizeof(const char *));
-		char **get_req = (char **) calloc(num_pairs, sizeof(const char *));
-		assert(set_req_len);
-		assert(get_req_len);
-		assert(set_req);
-		assert(get_req);
+		pthread_t th[MAX_CORE];
 		{
-			uint64_t _mem = 0;
-			{
-				char _set[2048], set[4096];
-				snprintf(_set, sizeof(_set), "set %%0%dx 0 0 %%lu\r\n", key_len);
-				{
-					uint64_t i;
-					for (i = 0; i < num_pairs && !should_stop; i++) {
-						snprintf(set, sizeof(set), _set, i, val_len);
-						set_req[i] = strdup(set);
-						set_req_len[i] = strlen(set_req[i]);
-						_mem += set_req_len[i] + 1;
-					}
-				}
+			unsigned short i;
+			for (i = 0; i < _num_cores; i++) {
+				int err = pthread_create(&th[i], NULL, server_thread, (void *)(uintptr_t) core_list[i]);
+				assert(!err);
 			}
-			{
-				char _get[2048], get[4096];
-				snprintf(_get, sizeof(_get), "get %%0%dx\r\n", key_len);
-				{
-					uint64_t i;
-					for (i = 0; i < num_pairs && !should_stop; i++) {
-						snprintf(get, sizeof(get), _get, i);
-						get_req[i] = strdup(get);
-						get_req_len[i] = strlen(get_req[i]);
-						_mem += get_req_len[i] + 1;
-					}
-				}
-			}
-			printf("query set size ");
-			if (_mem < 1000)
-				printf("%lu bytes\n", _mem);
-			else if (_mem < 1000000)
-				printf("%lu.%03lu KB\n", _mem / 1000, _mem % 1000);
-			else if (_mem < 1000000000)
-				printf("%lu.%03lu MB\n", _mem / 1000000, (_mem % 1000000) / 1000);
-			else
-				printf("%lu.%03lu GB\n", _mem / 1000000000, (_mem % 1000000000) / 1000000);
 		}
-		{
-			uint32_t wait = 0;
-			struct thread_data *td = (struct thread_data *) calloc(num_cores, sizeof(struct thread_data));
-			assert(td);
+		while (!should_stop) {
+			sleep(1);
 			{
-				unsigned short i;
-				for (i = 0; i < num_cores; i++) {
-					td[i].thread_id = i;
-					td[i].num_cores = num_cores;
-					td[i].core = core_list[i];
-					td[i].workload.bypass_parser = bypass_parser;
-					td[i].workload.zipfian = zipfian;
-					td[i].workload.set_req = set_req;
-					td[i].workload.set_req_len = set_req_len;
-					td[i].workload.get_req = get_req;
-					td[i].workload.get_req_len = get_req_len;
-					td[i].workload.random = 88172645463325252UL * (i + 1);
-					td[i].workload.wait = &wait;
-					td[i].workload.num_pairs = num_pairs;
-					td[i].workload.key_len = key_len;
-					td[i].workload.val_len = val_len;
-					td[i].workload.write_ratio = write_ratio;
-					MPR_RING_NUM_SLOT(td[i].mpr) = INPUT_RING_SIZE;
-					MPR_RING_HEAD_IDX(td[i].mpr) = 0;
-					MPR_RING_HEAD_OFF(td[i].mpr) = 0;
-					MPR_RING_TAIL_IDX(td[i].mpr) = 0;
-					MPR_RING_TAIL_OFF(td[i].mpr) = 0;
-					{
-						int j;
-						for (j = 0; j < INPUT_RING_SIZE; j++)
-							MPR_SLOT_PTR(td[i].mpr, j) = (uint64_t) td[i].rxbuf[j];
-					}
-					{
-						int err = pthread_create(&td[i].th, NULL, server_thread, (void *) &td[i]);
-						assert(!err);
-					}
-				}
-			}
-			while (!should_stop) {
-				sleep(1);
+				uint8_t idx = cnt_idx;
+				cnt_idx = (idx ? 0 : 1);
 				{
-					uint8_t idx = cnt_idx;
-					cnt_idx = (idx ? 0 : 1);
+					uint64_t total_set = 0, total_get = 0;
 					{
-						uint64_t total_set = 0, total_get = 0;
-						{
-							unsigned short i;
-							for (i = 0; i < num_cores; i++) {
-								printf("[%u]: set %lu ops (stored %lu not stored %lu), get %lu ops (hit %lu miss %lu)\n",
-										core_list[i],
-										td[i].stat.set_cnt[idx], td[i].stat.stored_cnt[idx], td[i].stat.not_stored_cnt[idx],
-										td[i].stat.get_cnt[idx], td[i].stat.hit_cnt[idx], td[i].stat.miss_cnt[idx]);
-								total_set += td[i].stat.set_cnt[idx];
-								total_get += td[i].stat.get_cnt[idx];
-								memset(&td[i].stat, 0, sizeof(td[i].stat));
-							}
+						unsigned short i;
+						for (i = 0; i < _num_cores; i++) {
+							printf("[%u]: set %lu ops (stored %lu not stored %lu), get %lu ops (hit %lu miss %lu)\n",
+									core_list[i],
+									tds[i]->stat.set_cnt[idx], tds[i]->stat.stored_cnt[idx], tds[i]->stat.not_stored_cnt[idx],
+									tds[i]->stat.get_cnt[idx], tds[i]->stat.hit_cnt[idx], tds[i]->stat.miss_cnt[idx]);
+							total_set += tds[i]->stat.set_cnt[idx];
+							total_get += tds[i]->stat.get_cnt[idx];
+							memset(&tds[i]->stat, 0, sizeof(tds[i]->stat));
 						}
-						printf("total: set %lu ops, get %lu ops\n", total_set, total_get);
 					}
+					printf("total: total %lu, set %lu ops, get %lu ops\n", total_set + total_get, total_set, total_get);
 				}
 			}
-			{
-				unsigned short i;
-				for (i = 0; i < num_cores; i++) {
-					int err = pthread_join(td[i].th, NULL);
-					assert(!err);
-				}
+		}
+		{
+			unsigned short i;
+			for (i = 0; i < _num_cores; i++) {
+				int err = pthread_join(th[i], NULL);
+				assert(!err);
 			}
-			free(td);
 		}
-		{
-			uint64_t i;
-			for (i = 0; i < num_pairs; i++)
-				free(set_req[i]);
-		}
-		{
-			uint64_t i;
-			for (i = 0; i < num_pairs; i++)
-				free(get_req[i]);
-		}
-		free(get_req);
-		free(set_req);
-		free(get_req_len);
-		free(set_req_len);
 	}
 	return 0;
 }
@@ -2216,7 +2201,7 @@ int main(int argc, char *const *argv)
 Please type the following command to compile the benchmark program. We will have an executable file named ```a.out```.
 
 ```
-gcc -O3 -pipe -g -rdynamic -Werror -Wextra -Wall -D_GNU_SOURCE ./main.c -lpthread -lm
+gcc -O3 -pipe -g -rdynamic -Werror -Wextra -Wall -D_GNU_SOURCE ./main.c -lpthread -lnuma -lm
 ```
 
 The following is an example command.
