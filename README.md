@@ -916,38 +916,95 @@ struct mc_conn {
 	char rxbuf[(1UL<<21)];
 };
 
-static char dist_zipfian;
-static double zipf_alpha, zipf_zetan, zipf_eta, zipf_theta;
-static uint64_t num_pairs;
-static uint64_t randval[MAX_THREAD];
-static uint64_t *set_req_len;
-static uint64_t *get_req_len;
-static char **set_req;
-static char **get_req;
-static uint32_t key_len, val_len, write_ratio;
-static struct mc_conn *mcn[0xffff /* port */]; /* XXX: assuming a single client */
-static _Atomic uint8_t mc_cnt_idx;
-struct mc_counter {
+struct mc_td {
+	char key_base[256];
+	uint32_t key_len;
+	uint32_t val_len;
+	uint32_t write_ratio;
+	uint64_t num_pairs;
+	uint64_t random;
+	uint64_t set_req_len;
+	uint64_t get_req_len;
+	char *set_req_base;
+	char *get_req_base;
+	uint64_t mc_dbg_prev_print;
+	uint8_t dist_zipfian;
+	uint8_t load_first;
 	struct {
-		uint64_t success;
-		uint64_t failed;
-		uint64_t error;
-	} op[2];
+		double alpha;
+		double zetan;
+		double eta;
+		double theta;
+	} zipfian;
+	struct {
+		struct {
+			uint64_t success;
+			uint64_t failed;
+			uint64_t error;
+		} op[2];
+	} mcnt[2];
+	struct mc_conn *mcn[0xffff /* port */]; /* XXX: assuming a single client */
 };
-static struct mc_counter mc_count[2][MAX_THREAD];
+
+static char _dist_zipfian;
+static double zipf_alpha, zipf_zetan, zipf_eta, zipf_theta;
+static uint64_t _num_pairs;
+static uint32_t _key_len, _val_len, _write_ratio;
+static _Atomic uint8_t mc_cnt_idx;
 static _Atomic uint64_t load_req_id;
-static uint64_t load_first;
-static uint64_t mc_dbg_prev_print;
+static uint8_t _load_first;
+static struct mc_td *mtds[MAX_THREAD];
+static pthread_spinlock_t mtds_lock;
 
 static void *iip_ops_tcp_connected(void *mem, void *handle, void *m, void *opaque)
 {
 	void *ret = __o_iip_ops_tcp_connected(mem, handle, m, opaque);
 	assert(ret);
 	{
-		uint16_t port = ntohs(PB_TCP(m)->dst_be);
-		mcn[port] = malloc(sizeof(struct mc_conn));
-		assert(mcn[port]);
-		mcn[port]->req_type = 0;
+		void **opaque_array = (void **) opaque;
+		struct thread_data *td = (struct thread_data *) opaque_array[2];
+		if (td->tcp.conn_list_cnt == 1) {
+			struct mc_td *mtd = (struct mc_td *) mem_alloc_local(sizeof(struct mc_td));
+			mtd->key_len = _key_len;
+			mtd->val_len = _val_len;
+			mtd->write_ratio = _write_ratio;
+			mtd->num_pairs = _num_pairs;
+			mtd->dist_zipfian = _dist_zipfian;
+			mtd->load_first = _load_first;
+			{
+				char _set[2048], set[4096];
+				snprintf(_set, sizeof(_set), "set %%0%dx 0 0 %u\r\n", mtd->key_len, mtd->val_len);
+				snprintf(set, sizeof(set), _set, 0, mtd->val_len);
+				mtd->set_req_len = strlen(set);
+				mtd->set_req_base = (char *) mem_alloc_local(mtd->set_req_len);
+				memcpy(mtd->set_req_base, set, mtd->set_req_len);
+			}
+			{
+				char _get[2048], get[4096];
+				snprintf(_get, sizeof(_get), "get %%0%dx\r\n", mtd->key_len);
+				snprintf(get, sizeof(get), _get, 0);
+				mtd->get_req_len = strlen(get);
+				mtd->get_req_base = (char *) mem_alloc_local(mtd->get_req_len);
+				memcpy(mtd->get_req_base, get, mtd->get_req_len);
+			}
+			snprintf(mtd->key_base, sizeof(mtd->key_base), "%%0%dx", mtd->key_len);
+			mtd->zipfian.alpha = zipf_alpha;
+			mtd->zipfian.zetan = zipf_zetan;
+			mtd->zipfian.eta   = zipf_eta;
+			mtd->zipfian.theta = zipf_theta;
+			mtd->random = 88172645463325252UL * (td->core_id + 1);
+			td->prev_arp = (uintptr_t) mtd; /* XXX: reuse variable field for random number generator */
+			mtds[td->core_id] = mtd;
+		}
+		{
+			struct mc_td *mtd = (struct mc_td *) td->prev_arp;
+			{
+				uint16_t port = ntohs(PB_TCP(m)->dst_be);
+				mtd->mcn[port] = mem_alloc_local(sizeof(struct mc_conn));
+				assert(mtd->mcn[port]);
+				mtd->mcn[port]->req_type = 0;
+			}
+		}
 	}
 	return ret;
 }
@@ -957,12 +1014,29 @@ static void iip_ops_tcp_closed(void *handle,
 			       uint8_t peer_mac[], uint32_t peer_ip4_be, uint16_t peer_port_be,
 			       void *tcp_opaque, void *opaque)
 {
-	{
-		uint16_t port = ntohs(local_port_be);
-		free(mcn[port]);
-		mcn[port] = 0;
-	}
 	__o_iip_ops_tcp_closed(handle, local_mac, local_ip4_be, local_port_be, peer_mac, peer_ip4_be, peer_port_be, tcp_opaque, opaque);
+	{
+		void **opaque_array = (void **) opaque;
+		struct thread_data *td = (struct thread_data *) opaque_array[2];
+		pthread_spin_lock(&mtds_lock);
+		mtds[td->core_id] = NULL;
+		pthread_spin_unlock(&mtds_lock);
+		{
+			struct mc_td *mtd = (struct mc_td *) td->prev_arp;
+			{
+				uint16_t port = ntohs(local_port_be);
+				mem_free(mtd->mcn[port], sizeof(struct mc_conn));
+				mtd->mcn[port] = NULL;
+			}
+		}
+		if (td->tcp.conn_list_cnt == 0) {
+			struct mc_td *mtd = (struct mc_td *) td->prev_arp;
+			mem_free(mtd->set_req_base, mtd->set_req_len);
+			mem_free(mtd->get_req_base, mtd->get_req_len);
+			mem_free(mtd, sizeof(struct mc_td));
+			td->prev_arp = 0; /* XXX: reuse variable field for random number generator */
+		}
+	}
 }
 
 #define RANDOM_XORSHIFT64(__r) \
@@ -976,21 +1050,28 @@ static void send_set_request(uint64_t req_id, void *mem, void *handle, void *opa
 {
 	void **opaque_array = (void **) opaque;
 	struct thread_data *td = (struct thread_data *) opaque_array[2];
+	struct mc_td *mtd = (struct mc_td *) td->prev_arp;
 	{
 		void *p = NULL;
 		uint16_t tmp_len = 0;
 		{
 			uint64_t l = 0;
-			while (l < set_req_len[req_id]) {
+			while (l < mtd->set_req_len) {
 				assert(!p);
 				assert(!tmp_len);
 				p = iip_ops_pkt_alloc(opaque);
 				assert(p);
 				{
-					uint64_t _l = set_req_len[req_id] - l;
+					uint64_t _l = mtd->set_req_len - l;
 					if (_l > ANTICIPATED_PKT_BUF_LEN)
 						_l = ANTICIPATED_PKT_BUF_LEN;
-					memcpy(iip_ops_pkt_get_data(p, opaque), &set_req[req_id][l], _l);
+					memcpy(iip_ops_pkt_get_data(p, opaque), &mtd->set_req_base[l], _l);
+					if (!l) {
+						char key[250];
+						assert(_l > 4 + mtd->key_len); /* XXX: lazy check */
+						snprintf(key, sizeof(key), mtd->key_base, req_id);
+						memcpy(iip_ops_pkt_get_data(p, opaque) + 4, key, mtd->key_len);
+					}
 					if (_l == ANTICIPATED_PKT_BUF_LEN) {
 						iip_ops_pkt_set_len(p, ANTICIPATED_PKT_BUF_LEN, opaque);
 						iip_tcp_send(mem, handle, p, 0, opaque);
@@ -1006,12 +1087,12 @@ static void send_set_request(uint64_t req_id, void *mem, void *handle, void *opa
 		}
 		{
 			uint64_t l = 0;
-			while (l < val_len) {
+			while (l < mtd->val_len) {
 				if (!p)
 					p = iip_ops_pkt_alloc(opaque);
 				assert(p);
 				{
-					uint64_t _l = val_len - l;
+					uint64_t _l = mtd->val_len - l;
 					if (_l > ANTICIPATED_PKT_BUF_LEN - tmp_len)
 						_l = ANTICIPATED_PKT_BUF_LEN - tmp_len;
 					memset((char *) iip_ops_pkt_get_data(p, opaque) + tmp_len, 'A', _l);
@@ -1071,12 +1152,13 @@ static void iip_ops_tcp_payload(void *mem, void *handle, void *m,
 {
 	void **opaque_array = (void **) opaque;
 	struct thread_data *td = (struct thread_data *) opaque_array[2];
+	struct mc_td *mtd = (struct mc_td *) td->prev_arp;
 	uint16_t port = ntohs(PB_TCP(m)->dst_be);
 	uint8_t send_next = 0;
-	assert(sizeof(mcn[port]->rxbuf[mcn[port]->len] - mcn[port]->len > PB_TCP_PAYLOAD_LEN(m) - head_off - tail_off));
-	memcpy(&mcn[port]->rxbuf[mcn[port]->len], PB_TCP_PAYLOAD(m) + head_off, PB_TCP_PAYLOAD_LEN(m) - head_off - tail_off);
-	mcn[port]->len += PB_TCP_PAYLOAD_LEN(m) - head_off - tail_off;
-	mcn[port]->rxbuf[mcn[port]->len] = '\0';
+	assert(sizeof(mtd->mcn[port]->rxbuf[mtd->mcn[port]->len] - mtd->mcn[port]->len > PB_TCP_PAYLOAD_LEN(m) - head_off - tail_off));
+	memcpy(&mtd->mcn[port]->rxbuf[mtd->mcn[port]->len], PB_TCP_PAYLOAD(m) + head_off, PB_TCP_PAYLOAD_LEN(m) - head_off - tail_off);
+	mtd->mcn[port]->len += PB_TCP_PAYLOAD_LEN(m) - head_off - tail_off;
+	mtd->mcn[port]->rxbuf[mtd->mcn[port]->len] = '\0';
 	td->monitor.counter[td->monitor.idx].rx_bytes += PB_TCP_PAYLOAD_LEN(m) - head_off - tail_off;
 	td->monitor.counter[td->monitor.idx].rx_pkt += 1;
 	{
@@ -1084,66 +1166,66 @@ static void iip_ops_tcp_payload(void *mem, void *handle, void *m,
 		td->monitor.latency.val[td->monitor.latency.cnt++ % NUM_MONITOR_LATENCY_RECORD] = now - ((struct tcp_opaque *) tcp_opaque)->monitor.ts;
 		((struct tcp_opaque *) tcp_opaque)->monitor.ts = now;
 	}
-	while (mcn[port]->len) {
+	while (mtd->mcn[port]->len) {
 		char found_error = 0;
-		if (mcn[port]->req_type == 2) {
-			if (mcn[port]->len >= 7 && mcn[port]->rxbuf[0] == 'E') {
-				if (!memcmp(mcn[port]->rxbuf, "ERROR\r\n", 7)) {
-					memmove(mcn[port]->rxbuf, &mcn[port]->rxbuf[7], mcn[port]->len - 7);
-					mcn[port]->len -= 7;
+		if (mtd->mcn[port]->req_type == 2) {
+			if (mtd->mcn[port]->len >= 7 && mtd->mcn[port]->rxbuf[0] == 'E') {
+				if (!memcmp(mtd->mcn[port]->rxbuf, "ERROR\r\n", 7)) {
+					memmove(mtd->mcn[port]->rxbuf, &mtd->mcn[port]->rxbuf[7], mtd->mcn[port]->len - 7);
+					mtd->mcn[port]->len -= 7;
 					send_next = 1;
 					{
 						uint8_t cid = mc_cnt_idx;
-						mc_count[cid][td->core_id].op[1].error++;
+						mtd->mcnt[cid].op[1].error++;
 					}
 					continue;
 				} else
 					found_error = 1;
-			} else if (mcn[port]->len >= 8 && mcn[port]->rxbuf[0] == 'S') {
-				if (!memcmp(mcn[port]->rxbuf, "STORED\r\n", 8)) {
-					memmove(mcn[port]->rxbuf, &mcn[port]->rxbuf[8], mcn[port]->len - 8);
-					mcn[port]->len -= 8;
+			} else if (mtd->mcn[port]->len >= 8 && mtd->mcn[port]->rxbuf[0] == 'S') {
+				if (!memcmp(mtd->mcn[port]->rxbuf, "STORED\r\n", 8)) {
+					memmove(mtd->mcn[port]->rxbuf, &mtd->mcn[port]->rxbuf[8], mtd->mcn[port]->len - 8);
+					mtd->mcn[port]->len -= 8;
 					send_next = 1;
 					{
 						uint8_t cid = mc_cnt_idx;
-						mc_count[cid][td->core_id].op[1].success++;
+						mtd->mcnt[cid].op[1].success++;
 					}
 					continue;
 				} else
 					found_error = 1;
 			} else
 				break;
-		} else if (mcn[port]->req_type == 1) {
-			if (mcn[port]->len >= 7 && mcn[port]->rxbuf[0] == 'E') {
-				if (!memcmp(mcn[port]->rxbuf, "ERROR\r\n", 7)) {
-					memmove(mcn[port]->rxbuf, &mcn[port]->rxbuf[7], mcn[port]->len - 7);
-					mcn[port]->len -= 7;
+		} else if (mtd->mcn[port]->req_type == 1) {
+			if (mtd->mcn[port]->len >= 7 && mtd->mcn[port]->rxbuf[0] == 'E') {
+				if (!memcmp(mtd->mcn[port]->rxbuf, "ERROR\r\n", 7)) {
+					memmove(mtd->mcn[port]->rxbuf, &mtd->mcn[port]->rxbuf[7], mtd->mcn[port]->len - 7);
+					mtd->mcn[port]->len -= 7;
 					send_next = 1;
 					{
 						uint8_t cid = mc_cnt_idx;
-						mc_count[cid][td->core_id].op[0].error++;
+						mtd->mcnt[cid].op[0].error++;
 					}
 					continue;
 				} else
 					found_error = 1;
-			} else if (mcn[port]->len >= 5 && mcn[port]->rxbuf[0] == 'E') {
-				if (!memcmp(mcn[port]->rxbuf, "END\r\n", 5)) {
-					memmove(mcn[port]->rxbuf, &mcn[port]->rxbuf[5], mcn[port]->len - 5);
-					mcn[port]->len -= 5;
+			} else if (mtd->mcn[port]->len >= 5 && mtd->mcn[port]->rxbuf[0] == 'E') {
+				if (!memcmp(mtd->mcn[port]->rxbuf, "END\r\n", 5)) {
+					memmove(mtd->mcn[port]->rxbuf, &mtd->mcn[port]->rxbuf[5], mtd->mcn[port]->len - 5);
+					mtd->mcn[port]->len -= 5;
 					send_next = 1;
 					{
 						uint8_t cid = mc_cnt_idx;
-						mc_count[cid][td->core_id].op[0].failed++;
+						mtd->mcnt[cid].op[0].failed++;
 					}
 					continue;
 				} else
 					found_error = 1;
-			} else if (mcn[port]->len >= 6 && mcn[port]->rxbuf[0] == 'V') {
-				if (!memcmp(mcn[port]->rxbuf, "VALUE ", 6)) {
+			} else if (mtd->mcn[port]->len >= 6 && mtd->mcn[port]->rxbuf[0] == 'V') {
+				if (!memcmp(mtd->mcn[port]->rxbuf, "VALUE ", 6)) {
 					uint64_t j;
 					int64_t word_cnt = 0, prev_space = 0, prev_r = 0, word_begin = 0;
-					for (j = 0; j < mcn[port]->len && !found_error; j++) {
-						switch (mcn[port]->rxbuf[j]) {
+					for (j = 0; j < mtd->mcn[port]->len && !found_error; j++) {
+						switch (mtd->mcn[port]->rxbuf[j]) {
 						case ' ':
 							if (!prev_space)
 								word_cnt++;
@@ -1158,21 +1240,21 @@ static void iip_ops_tcp_payload(void *mem, void *handle, void *m,
 							if (prev_r) {
 								if (word_cnt == 3) {
 									uint64_t val_len;
-									mcn[port]->rxbuf[j-1] = '\0';
-									val_len = atol(&mcn[port]->rxbuf[word_begin]);
-									mcn[port]->rxbuf[j-1] = '\r';
-									if (mcn[port]->len >= j + 1 + val_len + 2 + 5) {
-										if (!memcmp(&mcn[port]->rxbuf[j + 1 + val_len + 2], "END\r\n", 5)) {
-										memmove(mcn[port]->rxbuf, &mcn[port]->rxbuf[j + 1 + val_len + 2 + 5], mcn[port]->len - (j + 1 + val_len + 2 + 5));
-										mcn[port]->len -= j + 1 + val_len + 2 + 5;
-										{
-										uint8_t cid = mc_cnt_idx;
-										mc_count[cid][td->core_id].op[0].success++;
-										}
-										send_next = 1;
-										continue;
+									mtd->mcn[port]->rxbuf[j-1] = '\0';
+									val_len = atol(&mtd->mcn[port]->rxbuf[word_begin]);
+									mtd->mcn[port]->rxbuf[j-1] = '\r';
+									if (mtd->mcn[port]->len >= j + 1 + val_len + 2 + 5) {
+										if (!memcmp(&mtd->mcn[port]->rxbuf[j + 1 + val_len + 2], "END\r\n", 5)) {
+											memmove(mtd->mcn[port]->rxbuf, &mtd->mcn[port]->rxbuf[j + 1 + val_len + 2 + 5], mtd->mcn[port]->len - (j + 1 + val_len + 2 + 5));
+											mtd->mcn[port]->len -= j + 1 + val_len + 2 + 5;
+											{
+												uint8_t cid = mc_cnt_idx;
+												mtd->mcnt[cid].op[0].success++;
+											}
+											send_next = 1;
+											continue;
 										} else
-										found_error = 1;
+											found_error = 1;
 									}
 								} else
 									found_error = 1;
@@ -1194,7 +1276,7 @@ static void iip_ops_tcp_payload(void *mem, void *handle, void *m,
 			} else
 				found_error = 1;
 		} else {
-			mcn[port]->len = 0;
+			mtd->mcn[port]->len = 0;
 			send_next = 1;
 		}
 		if (found_error)
@@ -1202,49 +1284,55 @@ static void iip_ops_tcp_payload(void *mem, void *handle, void *m,
 	}
 	if (send_next) {
 		char first_loading = 0;
-		if (load_first) {
+		if (mtd->load_first) {
 			uint64_t req_id = load_req_id++;
-			if (req_id < num_pairs) {
-				mcn[port]->req_type = 2;
+			if (req_id < mtd->num_pairs) {
+				mtd->mcn[port]->req_type = 2;
 				send_set_request(req_id, mem, handle, opaque);
 				first_loading = 1;
 			} else {
-				if (req_id == num_pairs)
-					printf("%lu items has been loaded\n", num_pairs);
-				load_first = 0;
+				if (req_id == mtd->num_pairs)
+					printf("%lu items has been loaded\n", mtd->num_pairs);
+				mtd->load_first = 0;
 			}
 		}
-		if (!first_loading && !load_first) {
+		if (!first_loading && !mtd->load_first) {
 			uint64_t req_id;
-			RANDOM_XORSHIFT64(randval[td->core_id]);
-			if (dist_zipfian) {
+			RANDOM_XORSHIFT64(mtd->random);
+			if (mtd->dist_zipfian) {
 				double u, uz;
-				u = (((double) randval[td->core_id]) / UINT64_MAX);
-				uz = u * zipf_zetan;
+				u = (((double) mtd->random) / UINT64_MAX);
+				uz = u * mtd->zipfian.zetan;
 				if (uz < 1)
 					req_id = 0; /* base */
-				else if (uz < 1 + pow(0.5, zipf_theta))
+				else if (uz < 1 + pow(0.5, mtd->zipfian.theta))
 					req_id = 0 /* base */ + 1;
 				else
-					req_id = 0 /* base */ + (long)(num_pairs * pow(zipf_eta * u - zipf_eta + 1, zipf_alpha));
+					req_id = 0 /* base */ + (long)(mtd->num_pairs * pow(mtd->zipfian.eta * u - mtd->zipfian.eta + 1, mtd->zipfian.alpha));
 			} else
-				req_id = randval[td->core_id] % num_pairs;
-			RANDOM_XORSHIFT64(randval[td->core_id]);
-			if ((randval[td->core_id] % 100) < write_ratio) {
-				mcn[port]->req_type = 2;
+				req_id = mtd->random % mtd->num_pairs;
+			RANDOM_XORSHIFT64(mtd->random);
+			if ((mtd->random % 100) < mtd->write_ratio) {
+				mtd->mcn[port]->req_type = 2;
 				send_set_request(req_id, mem, handle, opaque);
 			} else {
-				mcn[port]->req_type = 1;
+				mtd->mcn[port]->req_type = 1;
 				{
 					uint64_t l = 0;
-					while (l < get_req_len[req_id]) {
+					while (l < mtd->get_req_len) {
 						void *p = iip_ops_pkt_alloc(opaque);
 						assert(p);
 						{
-							uint64_t _l = get_req_len[req_id];
+							uint64_t _l = mtd->get_req_len;
 							if (_l > ANTICIPATED_PKT_BUF_LEN)
 								_l = ANTICIPATED_PKT_BUF_LEN;
-							memcpy(iip_ops_pkt_get_data(p, opaque), &get_req[req_id][l], _l);
+							memcpy(iip_ops_pkt_get_data(p, opaque), &mtd->get_req_base[l], _l);
+							if (!l) {
+								char key[250];
+								assert(_l > 4 + mtd->key_len); /* XXX: lazy check */
+								snprintf(key, sizeof(key), mtd->key_base, req_id);
+								memcpy(iip_ops_pkt_get_data(p, opaque) + 4, key, mtd->key_len);
+							}
 							iip_ops_pkt_set_len(p, _l, opaque);
 							iip_tcp_send(mem, handle, p, 0x08U, opaque);
 							td->monitor.counter[td->monitor.idx].tx_bytes += _l;
@@ -1262,11 +1350,12 @@ static void iip_ops_tcp_payload(void *mem, void *handle, void *m,
 static void __app_loop(void *mem, uint8_t mac[], uint32_t ip4_be, uint32_t *next_us, void *opaque)
 {
 	void **opaque_array = (void **) opaque;
-	struct app_data *ad = (struct app_data *) opaque_array[1];
 	struct thread_data *td = (struct thread_data *) opaque_array[2];
-	if (!__app_close_posted && !td->core_id) {
+	if (!__app_close_posted && !td->core_id && mtds[0]) {
+		struct mc_td *mtd = (struct mc_td *) td->prev_arp;
 		uint64_t now = BENCH_IIP_NOW(opaque);
-		if (1000000000UL < now - mc_dbg_prev_print) {
+		pthread_spin_lock(&mtds_lock);
+		if (1000000000UL < now - mtd->mc_dbg_prev_print) {
 			uint8_t cid = mc_cnt_idx;
 			mc_cnt_idx = (cid == 0 ? 1 : 0);
 			{
@@ -1275,21 +1364,22 @@ static void __app_loop(void *mem, uint8_t mac[], uint32_t ip4_be, uint32_t *next
 				{
 					uint16_t i;
 					for (i = 0; i < MAX_THREAD; i++) {
-						if (ad->tds[i]) {
+						if (mtds[i]) {
 							printf("[%u] set success %lu failed %lu error %lu, get success %lu failed %lu error %lu\n",
 									i,
-									mc_count[cid][i].op[1].success,
-									mc_count[cid][i].op[1].failed,
-									mc_count[cid][i].op[1].error,
-									mc_count[cid][i].op[0].success,
-									mc_count[cid][i].op[0].failed,
-									mc_count[cid][i].op[0].error);
-							total[0] += mc_count[cid][i].op[1].success;
-							total[1] += mc_count[cid][i].op[1].failed;
-							total[2] += mc_count[cid][i].op[1].error;
-							total[3] += mc_count[cid][i].op[0].success;
-							total[4] += mc_count[cid][i].op[0].failed;
-							total[5] += mc_count[cid][i].op[0].error;
+									mtds[i]->mcnt[cid].op[1].success,
+									mtds[i]->mcnt[cid].op[1].failed,
+									mtds[i]->mcnt[cid].op[1].error,
+									mtds[i]->mcnt[cid].op[0].success,
+									mtds[i]->mcnt[cid].op[0].failed,
+									mtds[i]->mcnt[cid].op[0].error);
+							total[0] += mtds[i]->mcnt[cid].op[1].success;
+							total[1] += mtds[i]->mcnt[cid].op[1].failed;
+							total[2] += mtds[i]->mcnt[cid].op[1].error;
+							total[3] += mtds[i]->mcnt[cid].op[0].success;
+							total[4] += mtds[i]->mcnt[cid].op[0].failed;
+							total[5] += mtds[i]->mcnt[cid].op[0].error;
+							memset(&mtds[i]->mcnt[cid], 0, sizeof(mtds[i]->mcnt[cid]));
 						}
 					}
 					printf("total %lu: set %lu (success %lu failed %lu error %lu), get %lu (success %lu failed %lu error %lu)\n",
@@ -1298,11 +1388,11 @@ static void __app_loop(void *mem, uint8_t mac[], uint32_t ip4_be, uint32_t *next
 							total[0], total[1], total[2],
 							total[3] + total[4] + total[5],
 							total[3], total[4], total[5]);
-					memset(mc_count[cid], 0, sizeof(mc_count[cid]));
 				}
 			}
-			mc_dbg_prev_print = now;
+			mtd->mc_dbg_prev_print = now;
 		}
+		pthread_spin_unlock(&mtds_lock);
 	}
 	__o__app_loop(mem, mac, ip4_be, next_us, opaque);
 }
@@ -1312,43 +1402,37 @@ static void *__app_init(int argc, char *const *argv)
 	void *ret = __o__app_init(argc, argv);
 	{
 		load_req_id = 0;
-		load_first = 0;
 		mc_cnt_idx = 0;
-		memset(mc_count, 0, sizeof(mc_count));
-		dist_zipfian = 0;
-		num_pairs = 1;
-		key_len = 32;
-		val_len = 32;
-		write_ratio = 0;
-		mc_dbg_prev_print = 0;
-		{
-			uint64_t i;
-			for (i = 0; i < MAX_THREAD; i++)
-				randval[i] = 88172645463325252UL * (i + 1);
-		}
-		memset(mcn, 0, sizeof(mcn));
+		_load_first = 0;
+		_dist_zipfian = 0;
+		_num_pairs = 1;
+		_key_len = 32;
+		_val_len = 32;
+		_write_ratio = 0;
+		memset(mtds, 0, sizeof(mtds));
+		pthread_spin_init(&mtds_lock, PTHREAD_PROCESS_PRIVATE);
 	}
 	{ /* parse arguments */
 		int ch;
 		while ((ch = getopt(argc, argv, "dln:k:v:w:")) != -1) {
 			switch (ch) {
 			case 'd':
-				dist_zipfian = 1;
+				_dist_zipfian = 1;
 				break;
 			case 'k':
-				key_len = atoi(optarg);
+				_key_len = atoi(optarg);
 				break;
 			case 'l':
-				load_first = 1;
+				_load_first = 1;
 				break;
 			case 'n':
-				num_pairs = atoi(optarg);
+				_num_pairs = atoi(optarg);
 				break;
 			case 'v':
-				val_len = atoi(optarg);
+				_val_len = atoi(optarg);
 				break;
 			case 'w':
-				write_ratio = atoi(optarg);
+				_write_ratio = atoi(optarg);
 				break;
 			default:
 				assert(0);
@@ -1356,15 +1440,15 @@ static void *__app_init(int argc, char *const *argv)
 			}
 		}
 	}
-	assert(key_len <= 250);
-	assert(val_len <= (1UL << 20));
-	assert(num_pairs > 0);
-	assert(write_ratio <= 100);
+	assert(_key_len <= 250);
+	assert(_val_len <= (1UL << 20));
+	assert(_num_pairs > 0);
+	assert(_write_ratio <= 100);
 	printf("%lu pairs, key %u bytes, val %u bytes, set %u%% get %u%%\n",
-			num_pairs, key_len, val_len, write_ratio, 100 - write_ratio);
-	if (load_first)
+			_num_pairs, _key_len, _val_len, _write_ratio, 100 - _write_ratio);
+	if (_load_first)
 		printf("load items first. note that this load is not optimized for speed\n");
-	if (dist_zipfian) { /* zipfian preparation */
+	if (_dist_zipfian) { /* zipfian preparation */
 		/*
 		 * Jim Gray et al, "Quickly Generating Billion-Record Synthetic Databases", SIGMOD 1994
 		 *
@@ -1375,67 +1459,21 @@ static void *__app_init(int argc, char *const *argv)
 		zipf_alpha = 1 / (1 - zipf_theta);
 		{
 			uint64_t i;
-			for (i = 0, zipf_zetan = 0; i < num_pairs; i++)
-				zipf_zetan += pow((double) 1.0 / (double) num_pairs, zipf_theta);
+			for (i = 0, zipf_zetan = 0; i < _num_pairs; i++)
+				zipf_zetan += pow((double) 1.0 / (double) _num_pairs, zipf_theta);
 		}
 		{
 			double zipf_zeta2 = 0;
 			{
 				uint64_t i;
 				for (i = 0; i < 2; i++)
-					zipf_zeta2 += pow((double) 1.0 / (double) num_pairs, zipf_theta);
+					zipf_zeta2 += pow((double) 1.0 / (double) _num_pairs, zipf_theta);
 			}
-			zipf_eta = (1 - pow(2.0 / (double) num_pairs, 1 - zipf_theta) / (1 - zipf_zeta2) / zipf_zetan);
+			zipf_eta = (1 - pow(2.0 / (double) _num_pairs, 1 - zipf_theta) / (1 - zipf_zeta2) / zipf_zetan);
 		}
 		printf("zipfian distribution\n");
 	} else
 		printf("uniform distribution\n");
-	set_req_len = (uint64_t *) calloc(num_pairs, sizeof(uint64_t));
-	get_req_len = (uint64_t *) calloc(num_pairs, sizeof(uint64_t));
-	set_req = (char **) calloc(num_pairs, sizeof(const char *));
-	get_req = (char **) calloc(num_pairs, sizeof(const char *));
-	assert(set_req_len);
-	assert(get_req_len);
-	assert(set_req);
-	assert(get_req);
-	{
-		uint64_t _mem = 0;
-		{
-			char _set[2048], set[4096];
-			snprintf(_set, sizeof(_set), "set %%0%dx 0 0 %%lu\r\n", key_len);
-			{
-				uint64_t i;
-				for (i = 0; i < num_pairs; i++) {
-					snprintf(set, sizeof(set), _set, i, val_len);
-					set_req[i] = strdup(set);
-					set_req_len[i] = strlen(set_req[i]);
-					_mem += set_req_len[i] + 1;
-				}
-			}
-		}
-		{
-			char _get[2048], get[4096];
-			snprintf(_get, sizeof(_get), "get %%0%dx\r\n", key_len);
-			{
-				uint64_t i;
-				for (i = 0; i < num_pairs; i++) {
-					snprintf(get, sizeof(get), _get, i);
-					get_req[i] = strdup(get);
-					get_req_len[i] = strlen(get_req[i]);
-					_mem += get_req_len[i] + 1;
-				}
-			}
-		}
-		printf("query set size ");
-		if (_mem < 1000)
-			printf("%lu bytes\n", _mem);
-		else if (_mem < 1000000)
-			printf("%lu.%03lu KB\n", _mem / 1000, _mem % 1000);
-		else if (_mem < 1000000000)
-			printf("%lu.%03lu MB\n", _mem / 1000000, (_mem % 1000000) / 1000);
-		else
-			printf("%lu.%03lu GB\n", _mem / 1000000000, (_mem % 1000000000) / 1000000);
-	}
 	return ret;
 }
 
