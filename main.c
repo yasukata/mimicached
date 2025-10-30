@@ -169,6 +169,8 @@ static uint64_t kv_conf_hash_table_cnt = 1;
 #define SLAB_FLAG_ATOMIC_RELEASE __ATOMIC_RELEASE
 #define SLAB_FLAG_ATOMIC_ACQUIRE __ATOMIC_ACQUIRE
 
+#define SLAB_OPS_OPAQUE2STD(__o) ((struct slab_thread_data *)((uintptr_t)(__o) + sizeof(struct kv_thread_data))) /* assuming this is subsequent to kv_thread_data */
+
 #include "slab.c"
 
 #define NUM_MPR_SLOT (128)
@@ -185,6 +187,7 @@ struct tcp_opaque {
 
 struct thread_data {
 	struct kv_thread_data ktd;
+	struct slab_thread_data std;
 	void *gc_key_list;
 	void *gc_val_list;
 	pthread_t th;
