@@ -146,6 +146,10 @@ Then, please save the following C program as a file named ```main.c```.
 
 #include <pthread.h>
 
+#include <numa.h>
+#define mem_alloc_local	numa_alloc_local
+#define mem_free	numa_free
+
 #define mp_assert assert
 #define mp_memcmp memcmp
 #define mp_memcpy memcpy
@@ -212,9 +216,6 @@ static void kv_ops_slab_free(void *, uint64_t, void *);
 #define KV_FLAG_ATOMIC_RELEASE __ATOMIC_RELEASE
 #define KV_FLAG_ATOMIC_ACQUIRE __ATOMIC_ACQUIRE
 
-#define KV_OPS_MALLOC(__s, __o) malloc(__s)
-#define KV_OPS_FREE(__p, __s, __o) free(__p)
-
 #define KV_OPS_OPAQUE2KTD(__o) ((struct kv_thread_data *)(__o)) /* assuming opaque has kv_thread_data at its top */
 
 #include "../kv.c"
@@ -226,6 +227,8 @@ static void kv_ops_slab_free(void *, uint64_t, void *);
 #define SLAB_FLAG_ATOMIC_ACQ_REL __ATOMIC_ACQ_REL
 #define SLAB_FLAG_ATOMIC_RELEASE __ATOMIC_RELEASE
 #define SLAB_FLAG_ATOMIC_ACQUIRE __ATOMIC_ACQUIRE
+
+#define SLAB_OPS_OPAQUE2STD(__o) ((struct slab_thread_data *)((uintptr_t)(__o) + sizeof(struct kv_thread_data))) /* assuming this is subsequent to kv_thread_data */
 
 #include "../slab.c"
 
@@ -244,6 +247,7 @@ struct mc_conn {
 
 struct thread_data {
 	struct kv_thread_data ktd;
+	struct slab_thread_data std;
 	int core;
 	uint8_t mpr[MPR_MEM_SIZE(INPUT_RING_SIZE)];
 	pthread_t th;
@@ -335,7 +339,7 @@ static void *server_thread(void *data)
 						struct epoll_event _ev;
 						memset(&_ev, 0, sizeof(_ev));
 						_ev.events = EPOLLIN;
-						_ev.data.ptr = calloc(1, sizeof(struct mc_conn) + MPR_MEM_SIZE(INPUT_RING_SIZE));
+						_ev.data.ptr = mem_alloc_local(sizeof(struct mc_conn) + MPR_MEM_SIZE(INPUT_RING_SIZE));
 						assert(_ev.data.ptr);
 						{
 							struct mc_conn *mc = (struct mc_conn *) _ev.data.ptr;
@@ -364,12 +368,12 @@ static void *server_thread(void *data)
 					if (MPR_RING_HEAD_IDX(mc->mpr) == (MPR_RING_TAIL_IDX(mc->mpr) + 1 == MPR_RING_NUM_SLOT(mc->mpr) ? 0 : MPR_RING_TAIL_IDX(mc->mpr) + 1)) {
 						printf("ring is full, close connection\n");
 						close(mc->fd);
-						free(mc);
+						mem_free(mc, sizeof(struct mc_conn) + MPR_MEM_SIZE(INPUT_RING_SIZE));
 					} else {
 						ssize_t rx = read(mc->fd, (char *) mc->rxbuf[MPR_RING_TAIL_IDX(mc->mpr)], sizeof(mc->rxbuf[MPR_RING_TAIL_IDX(mc->mpr)]));
 						if (rx <= 0) {
 							close(mc->fd);
-							free(mc);
+							mem_free(mc, sizeof(struct mc_conn) + MPR_MEM_SIZE(INPUT_RING_SIZE));
 						} else {
 							MPR_SLOT_LEN(mc->mpr, MPR_RING_TAIL_IDX(mc->mpr)) += rx;
 							MPR_RING_TAIL_OFF(mc->mpr) = MPR_SLOT_LEN(mc->mpr, MPR_RING_TAIL_IDX(mc->mpr));
@@ -394,14 +398,14 @@ static void *server_thread(void *data)
 										ssize_t tx = send(mc->fd, mc->txbuf, mc->cur, MSG_NOSIGNAL);
 										if (tx != (ssize_t) mc->cur) {
 											close(mc->fd);
-											free(mc);
+											mem_free(mc, sizeof(struct mc_conn) + MPR_MEM_SIZE(INPUT_RING_SIZE));
 											break;
 										}
 										mc->cur = 0;
 									}
 									if ((r < 0) || mc->err) {
 										close(mc->fd);
-										free(mc);
+										mem_free(mc, sizeof(struct mc_conn) + MPR_MEM_SIZE(INPUT_RING_SIZE));
 										break;
 									}
 									if (r == EAGAIN)
@@ -650,7 +654,7 @@ int main(int argc, char *const *argv)
 Afterwrad, please type the following command to compile ```main.c```; we will have an executable binary named ```a.out```.
 
 ```
-gcc -O3 -pipe -g -rdynamic -Werror -Wextra -Wall -D_GNU_SOURCE ./main.c -lpthread
+gcc -O3 -pipe -g -rdynamic -Werror -Wextra -Wall -D_GNU_SOURCE ./main.c -lpthread -lnuma
 ```
 
 We can start the program by the following command.
