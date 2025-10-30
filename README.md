@@ -1572,8 +1572,8 @@ Then, please save the following program as a file named ```main.c```.
 int printf_nothing(const char *format, ...) { (void) format; return 0; }
 #define MP_OPS_DEBUG_PRINTF printf_nothing
 
-#define MP_OPS_UTIL_TIME_NS(__o) ({ struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec * 1000000000UL + ts.tv_nsec; })
-
+static uint64_t mp_ops_util_time_ns(void *);
+#define MP_OPS_UTIL_TIME_NS mp_ops_util_time_ns
 static void mp_ops_clear_response(void *);
 #define MP_OPS_CLEAR_RESPONSE mp_ops_clear_response
 static long mp_ops_push_response(void *, const char *, size_t);
@@ -1623,6 +1623,8 @@ static uint64_t kv_conf_hash_table_cnt = 1;
 #define SLAB_FLAG_ATOMIC_RELEASE __ATOMIC_RELEASE
 #define SLAB_FLAG_ATOMIC_ACQUIRE __ATOMIC_ACQUIRE
 
+#define SLAB_OPS_OPAQUE2STD(__o) ((struct slab_thread_data *)((uintptr_t)(__o) + sizeof(struct kv_thread_data))) /* assuming this is subsequent to kv_thread_data */
+
 #include "../slab.c"
 
 #define MAX_CORE (____KV__CONF_MAX_THREAD_NUM)
@@ -1631,6 +1633,8 @@ static uint64_t kv_conf_hash_table_cnt = 1;
 
 struct thread_data {
 	struct kv_thread_data ktd;
+	struct slab_thread_data std;
+	uint64_t now;
 	void *gc_key_list;
 	void *gc_val_list;
 	pthread_t th;
@@ -1700,18 +1704,31 @@ static long mp_ops_push_response(void *opaque, const char *msg, size_t len)
 	}
 }
 
+static uint64_t mp_ops_util_time_ns(void *opaque)
+{
+	struct thread_data *td = (struct thread_data *) opaque;
+	return td->now;
+}
+
 static char _dist_zipfian, _bypass_parser;
 static double zipf_alpha, zipf_zetan, zipf_eta, zipf_theta;
 static uint64_t _num_pairs;
 static uint32_t _key_len, _val_len, _write_ratio, _num_cores;
+#ifndef __cplusplus
 static _Atomic uint8_t cnt_idx;
 static _Atomic uint32_t wait_cnt;
+#else
+#include <atomic>
+static std::atomic<uint8_t> cnt_idx;
+static std::atomic<uint32_t> wait_cnt;
+#endif
+static volatile uint64_t current_time;
 			
 static struct thread_data *tds[MAX_CORE];
 
 static void *server_thread(void *data)
 {
-	struct thread_data *td = mem_alloc_local(sizeof(struct thread_data));
+	struct thread_data *td = (struct thread_data *) mem_alloc_local(sizeof(struct thread_data));
 	assert(td);
 	memset(td, 0, sizeof(sizeof(struct thread_data)));
 	td->core_id = (uint32_t)(uintptr_t) data;
@@ -1762,6 +1779,7 @@ static void *server_thread(void *data)
 	MPR_SLOT_LEN(td->mpr, 2) = 2;
 	asm volatile ("" ::: "memory");
 	kv_register_ktd(&td->ktd, td->core_id);
+	tds[td->core_id] = td;
 	printf("core %u loads %lu entries\n", td->core_id, td->workload.num_pairs / td->num_cores);
 	{
 		uint64_t i;
@@ -1771,7 +1789,7 @@ static void *server_thread(void *data)
 				{
 					char key[250];
 					snprintf(key, sizeof(key), td->workload.key_base, (td->workload.num_pairs / td->num_cores) * td->core_id + i);
-					memcpy((void *) MPR_SLOT_PTR(td->mpr, 0) + 4, key, td->workload.key_len);
+					memcpy((void *)((uintptr_t) MPR_SLOT_PTR(td->mpr, 0) + 4), key, td->workload.key_len);
 				}
 				MPR_SLOT_LEN(td->mpr, 0) = td->workload.set_req_len;
 				MPR_RING_HEAD_IDX(td->mpr) = 0;
@@ -1785,6 +1803,7 @@ static void *server_thread(void *data)
 				while (1) {
 					long r;
 					{
+						td->now = current_time;
 						kv_thread_access_start((void *) td);
 						r = parse_memcached_request(td->mpr, (void *) td);
 						kv_thread_access_done((void *) td);
@@ -1817,11 +1836,14 @@ static void *server_thread(void *data)
 				{
 					char key[250];
 					snprintf(key, sizeof(key), td->workload.key_base, (td->workload.num_pairs / td->num_cores) * td->core_id + i);
+					td->now = current_time;
+					kv_thread_access_start((void *) td);
 					MP_OPS_KV_CMD(td->mpr,
 							(uint8_t *) key,
 							td->workload.key_len,
 							cmd,
 							(void *) td);
+					kv_thread_access_done((void *) td);
 				}
 				if (!(MP_KV_CMD_OPFLAGS(cmd) & MC_KV_CMD_OPFLAG_VIVIFY_ON_MISS))
 					td->stat.stored_cnt[cnt_idx]++;
@@ -1832,21 +1854,29 @@ static void *server_thread(void *data)
 					} else
 						assert(0);
 				}
+				MP_KV_CMD_OPFLAGS(cmd) = 0;
+				{
+					char key[250];
+					snprintf(key, sizeof(key), td->workload.key_base, (td->workload.num_pairs / td->num_cores) * td->core_id + i);
+					td->now = current_time;
+					kv_thread_access_start((void *) td);
+					MP_OPS_KV_CMD(td->mpr,
+							(uint8_t *) key,
+							td->workload.key_len,
+							cmd,
+							(void *) td);
+					kv_thread_access_done((void *) td);
+				}
+				assert(MP_KV_CMD_OPFLAGS(cmd) & MC_KV_CMD_OPFLAG_FOUND);
 			}
 		}
 	}
-	{
-		uint32_t i = 1;
-		(void) SLAB_OPS_ATOMIC_ADD_FETCH(&wait_cnt, i, SLAB_FLAG_ATOMIC_RELEASE);
-	}
+	wait_cnt++;
 	while (!should_stop) {
-		uint32_t wait;
-		KV_OPS_ATOMIC_LOAD(&wait_cnt, &wait, KV_FLAG_ATOMIC_ACQUIRE);
-		if (wait == td->num_cores)
+		if (wait_cnt == td->num_cores)
 			break;
 		usleep(100);
 	}
-	tds[td->core_id] = td;
 	printf("core %u start benchmarking\n", td->core_id);
 	while (!should_stop) {
 		uint64_t req_id;
@@ -1870,7 +1900,7 @@ static void *server_thread(void *data)
 				{
 					char key[250];
 					snprintf(key, sizeof(key), td->workload.key_base, req_id);
-					memcpy((void *) MPR_SLOT_PTR(td->mpr, 0) + 4, key, td->workload.key_len);
+					memcpy((void *)((uintptr_t) MPR_SLOT_PTR(td->mpr, 0) + 4), key, td->workload.key_len);
 				}
 				MPR_SLOT_LEN(td->mpr, 0) = td->workload.set_req_len;
 				MPR_RING_HEAD_IDX(td->mpr) = 0;
@@ -1884,7 +1914,7 @@ static void *server_thread(void *data)
 				{
 					char key[250];
 					snprintf(key, sizeof(key), td->workload.key_base, req_id);
-					memcpy((void *) MPR_SLOT_PTR(td->mpr, 0) + 4, key, td->workload.key_len);
+					memcpy((void *)((uintptr_t) MPR_SLOT_PTR(td->mpr, 0) + 4), key, td->workload.key_len);
 				}
 				MPR_SLOT_LEN(td->mpr, 0) = td->workload.get_req_len;
 				MPR_RING_HEAD_IDX(td->mpr) = 0;
@@ -1901,6 +1931,7 @@ static void *server_thread(void *data)
 				{
 					long r;
 					{
+						td->now = current_time;
 						kv_thread_access_start((void *) td);
 						r = parse_memcached_request(td->mpr, (void *) td);
 						kv_thread_access_done((void *) td);
@@ -1943,11 +1974,14 @@ static void *server_thread(void *data)
 			{
 				char key[250];
 				snprintf(key, sizeof(key), td->workload.key_base, req_id);
+				td->now = current_time;
+				kv_thread_access_start((void *) td);
 				MP_OPS_KV_CMD(td->mpr,
 						(uint8_t *) key,
 						td->workload.key_len,
 						cmd,
 						(void *) td);
+				kv_thread_access_done((void *) td);
 			}
 			if (td->workload.tmp_opt) {
 				if (!(MP_KV_CMD_OPFLAGS(cmd) & MC_KV_CMD_OPFLAG_UPDATE))
@@ -1983,6 +2017,7 @@ int main(int argc, char *const *argv)
 		memset(tds, 0, sizeof(tds));
 		wait_cnt = 0;
 	}
+	current_time = ({ struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec * 1000000000UL + ts.tv_nsec; });
 	slab_init(); /* TODO: better init */
 	slab_stat.mem_size = 2 * 1048576;
 	{
@@ -2161,26 +2196,33 @@ int main(int argc, char *const *argv)
 				assert(!err);
 			}
 		}
-		while (!should_stop) {
-			sleep(1);
-			{
-				uint8_t idx = cnt_idx;
-				cnt_idx = (idx ? 0 : 1);
-				{
-					uint64_t total_set = 0, total_get = 0;
+		{
+			uint64_t prev_print_time = current_time;
+			while (!should_stop) {
+				current_time = ({ struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec * 1000000000UL + ts.tv_nsec; });
+				usleep(500);
+				if (current_time - prev_print_time > 1000000000UL) {
+					uint8_t idx = cnt_idx;
+					cnt_idx = (idx ? 0 : 1);
 					{
-						unsigned short i;
-						for (i = 0; i < _num_cores; i++) {
-							printf("[%u]: set %lu ops (stored %lu not stored %lu), get %lu ops (hit %lu miss %lu)\n",
-									core_list[i],
-									tds[i]->stat.set_cnt[idx], tds[i]->stat.stored_cnt[idx], tds[i]->stat.not_stored_cnt[idx],
-									tds[i]->stat.get_cnt[idx], tds[i]->stat.hit_cnt[idx], tds[i]->stat.miss_cnt[idx]);
-							total_set += tds[i]->stat.set_cnt[idx];
-							total_get += tds[i]->stat.get_cnt[idx];
-							memset(&tds[i]->stat, 0, sizeof(tds[i]->stat));
+						uint64_t total_set = 0, total_get = 0;
+						{
+							unsigned short i;
+							for (i = 0; i < MAX_CORE; i++) {
+								if (tds[i]) {
+									printf("[%u]: set %lu ops (stored %lu not stored %lu), get %lu ops (hit %lu miss %lu)\n",
+											core_list[i],
+											tds[i]->stat.set_cnt[idx], tds[i]->stat.stored_cnt[idx], tds[i]->stat.not_stored_cnt[idx],
+											tds[i]->stat.get_cnt[idx], tds[i]->stat.hit_cnt[idx], tds[i]->stat.miss_cnt[idx]);
+									total_set += tds[i]->stat.set_cnt[idx];
+									total_get += tds[i]->stat.get_cnt[idx];
+									memset(&tds[i]->stat, 0, sizeof(tds[i]->stat));
+								}
+							}
 						}
+						printf("total: total %lu, set %lu ops, get %lu ops\n", total_set + total_get, total_set, total_get);
 					}
-					printf("total: total %lu, set %lu ops, get %lu ops\n", total_set + total_get, total_set, total_get);
+					prev_print_time = current_time;
 				}
 			}
 		}
