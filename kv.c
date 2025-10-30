@@ -49,6 +49,7 @@ struct kv_key {
 };
 
 struct kv_thread_data {
+	uint64_t ktd_id;
 	uint64_t enter_time;
 	uint64_t random;
 	uint64_t prev_gc_check_time;
@@ -532,6 +533,7 @@ static int kv_register_ktd(struct kv_thread_data *ktd, uint64_t ktd_id)
 		return -1;
 	ktd_ptr_array[ktd_id] = ktd;
 	ktd->random = 88172645463325252UL * (ktd_id + 1);
+	ktd->ktd_id = ktd_id;
 	return 0;
 }
 
