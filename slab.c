@@ -72,7 +72,7 @@ static void *kv_ops_slab_alloc(uint64_t s, void *opaque)
 						while (_md) {
 							struct slab_metadata *next = _md->next;
 							_md->next = std->slab_chains[_md->chain_idx];
-							std->slab_chains[_md->chain_idx] = _md->next;
+							std->slab_chains[_md->chain_idx] = _md;
 							_md = next;
 						}
 					}
@@ -116,7 +116,7 @@ static void *kv_ops_slab_alloc(uint64_t s, void *opaque)
 								new_md->owner = std;
 								new_md->chain_idx = chain_idx;
 								new_md->next = std->slab_chains[chain_idx];
-								std->slab_chains[chain_idx] = new_md;;
+								std->slab_chains[chain_idx] = new_md;
 							}
 						}
 					}
@@ -139,7 +139,7 @@ static void kv_ops_slab_free(void *p, uint64_t s, void *opaque)
 			struct slab_metadata *md = (struct slab_metadata *)((uintptr_t) p - sizeof(struct slab_metadata));
 			if (md->owner == std) {
 				md->next = std->slab_chains[md->chain_idx];
-				std->slab_chains[md->chain_idx] = md->next;
+				std->slab_chains[md->chain_idx] = md;
 			} else {
 				struct kv_thread_data *ktd = KV_OPS_OPAQUE2KTD(opaque);
 				while (1) {
