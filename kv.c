@@ -232,7 +232,6 @@ static void mp_ops_kv_cmd(void *mpr, const uint8_t *key, uint64_t key_len, uint8
 								MP_KV_CMD_ERRNO(cmd) = ENOMEM;
 								break;
 							}
-							mp_assert(new_v); /* TODO handle this */
 							if (MP_KV_CMD_OPFLAGS(cmd) & MC_KV_CMD_OPFLAG_SET_FLAG)
 								new_v->flags = MP_KV_CMD_FLAGS(cmd);
 							else
@@ -261,7 +260,7 @@ static void mp_ops_kv_cmd(void *mpr, const uint8_t *key, uint64_t key_len, uint8
 							new_v->cls = v->cls;
 							new_v->add_time = v->add_time;
 							new_v->len = val_len;
-							new_v->last_access = MP_OPS_UTIL_TIME_NS(opaque);;
+							new_v->last_access = MP_OPS_UTIL_TIME_NS(opaque);
 							new_v->delete_time = 0;
 							new_v->gc_next = NULL;
 							if (val_len) {
