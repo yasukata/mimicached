@@ -496,8 +496,8 @@ static void kv_eviction(uint64_t goal, void *opaque)
 {
 	struct kv_thread_data *ktd = KV_OPS_OPAQUE2KTD(opaque);
 	{ /* random eviction */
-		uint64_t released = 0;
-		while (released < goal) {
+		uint64_t released = 0, loopcnt = 0;
+		while (released < goal && loopcnt++ < 3 /* TODO: find an appropriate value */) {
 			{ /* xorshift64 */
 				ktd->random ^= ktd->random << 13;
 				ktd->random ^= ktd->random >> 7;
