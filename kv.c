@@ -26,14 +26,14 @@
 
 struct kv_item {
 	struct kv_item *next;
-	uint64_t key_len;
-	uint64_t val_len;
+	uint16_t extra_flags;
+	uint8_t cls;
+	uint8_t key_len;
+	uint32_t val_len;
 	uint64_t flags;
 	uint64_t exptime;
 	uint64_t cas_unique;
 	uint64_t last_access;
-	uint64_t cls;
-	uint64_t extra_flags;
 	uint64_t add_time;
 	uint8_t data[];
 };
