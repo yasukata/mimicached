@@ -419,7 +419,7 @@ static void *server_thread(void *data)
 					}
 				}
 			}
-			kv_garbage_collection((void *) td);
+			kv_maintenance((void *) td);
 		}
 		close(epfd);
 	}
@@ -1816,7 +1816,7 @@ static void *server_thread(void *data)
 					if (td->tx_cur >= 7 && memcmp(td->txbuf, "STORED\r\n", 7)) {
 						printf("%s", td->txbuf);
 						if (td->tx_cur >= 43 && !memcmp(td->txbuf, "SERVER_ERROR out of memory storing object\r\n", 43)) {
-							kv_garbage_collection((void *) td);
+							kv_maintenance((void *) td);
 							printf("NOTE: some key value pairs would be evicted\n");
 						} else
 							assert(0);
@@ -1853,7 +1853,7 @@ static void *server_thread(void *data)
 					td->stat.stored_cnt[cnt_idx]++;
 				else {
 					if (MP_KV_CMD_ERRNO(cmd) == MP_ERR_ENOMEM) {
-						kv_garbage_collection((void *) td);
+						kv_maintenance((void *) td);
 						printf("NOTE: some key value pairs would be evicted\n");
 					} else
 						assert(0);
@@ -1999,7 +1999,7 @@ static void *server_thread(void *data)
 					td->stat.miss_cnt[cnt_idx]++;
 			}
 		}
-		kv_garbage_collection((void *) td);
+		kv_maintenance((void *) td);
 	}
 	printf("core %u returns\n", td->core_id);
 	pthread_exit(NULL);
