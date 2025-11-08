@@ -39,6 +39,8 @@
 #define mem_alloc_local	numa_alloc_local
 #define mem_free	numa_free
 
+#include <pthread.h>
+
 static uint8_t verbose_level = 0;
 
 static void __debug_printf(const char *format, ...)
@@ -109,7 +111,7 @@ static int __printf_nothing(const char *format, ...) { (void) format; return 0; 
 #define mp_memcpy memcpy
 #define mp_memmove memmove
 
-#define MP_OPS_UTIL_TIME_NS(__o) ({ struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec * 1000000000UL + ts.tv_nsec; })
+#define MP_OPS_UTIL_TIME_NS(__o) ({ struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); (void)(__o); ts.tv_sec * 1000000000UL + ts.tv_nsec; })
 
 static void mp_ops_clear_response(void *);
 #define MP_OPS_CLEAR_RESPONSE mp_ops_clear_response
@@ -287,7 +289,7 @@ static void __app_loop(void *mem, uint8_t mac[], uint32_t ip4_be, uint32_t *next
 			break;
 		}
 	}
-	kv_garbage_collection((void *) td);
+	kv_maintenance((void *) td);
 	{ /* unused */
 		(void) mac;
 		(void) ip4_be;
