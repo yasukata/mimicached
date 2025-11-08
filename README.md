@@ -170,7 +170,7 @@ static void __debug_printf(const char *format, ...)
 
 #define MP_OPS_DEBUG_PRINTF __debug_printf
 
-#define MP_OPS_UTIL_TIME_NS(__o) ({ struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec * 1000000000UL + ts.tv_nsec; })
+#define MP_OPS_UTIL_TIME_NS(__o) ({ struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); (void)(__o); ts.tv_sec * 1000000000UL + ts.tv_nsec; })
 
 static void mp_ops_clear_response(void *);
 #define MP_OPS_CLEAR_RESPONSE mp_ops_clear_response
