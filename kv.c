@@ -42,6 +42,7 @@ struct kv_thread_data {
 	uint64_t ktd_id;
 	void *val_buf;
 	uint64_t random;
+	uint64_t eviction_goal;
 };
 
 static struct kv_item **hash_table;
@@ -336,43 +337,56 @@ static void kv_thread_access_done(void *opaque)
 	(void) opaque;
 }
 
-static void kv_garbage_collection(void *opaque)
+static void kv_maintenance(void *opaque)
 {
-	(void) opaque;
+	struct kv_thread_data *ktd = KV_OPS_OPAQUE2KTD(opaque);
+	if (ktd->eviction_goal) { /* random eviction */
+		uint64_t released = 0, loopcnt = 0;
+		while (released < ktd->eviction_goal && loopcnt++ < 3 /* TODO: find an appropriate value */) {
+			{ /* xorshift64 */
+				ktd->random ^= ktd->random << 13;
+				ktd->random ^= ktd->random >> 7;
+				ktd->random ^= ktd->random << 17;
+			}
+			{
+				uint64_t hash_table_idx = ktd->random % ____KV__CONF_HASH_TABLE_CNT;
+				{
+					uint64_t i;
+					for (i = 0; (i < ____KV__CONF_HASH_TABLE_CNT) && (released < ktd->eviction_goal); i++) {
+						uint64_t idx = (hash_table_idx + i) % ____KV__CONF_HASH_TABLE_CNT;
+						pthread_spin_lock(&lock[idx]);
+						{
+							struct kv_item *head = hash_table[idx];
+							if (head) {
+								struct kv_item *item = head;
+								while (item->next) item = item->next;
+								{
+									uint8_t cmd[MP_KV_CMD_SIZE];
+									memset(&cmd, 0, sizeof(cmd));
+									MP_KV_CMD_OPFLAGS(cmd) = MC_KV_CMD_OPFLAG_DELETE;
+									pthread_spin_unlock(&lock[idx]);
+									mp_ops_kv_cmd(NULL /* XXX: we are sure delete does not touch mpr */, item->data, item->key_len, cmd, opaque);
+									pthread_spin_lock(&lock[idx]);
+								}
+								released += sizeof(struct kv_item) + item->key_len + item->val_len;
+							}
+						}
+						pthread_spin_unlock(&lock[idx]);
+					}
+				}
+			}
+		}
+		if (ktd->eviction_goal <= released)
+			ktd->eviction_goal = 0;
+		else
+			ktd->eviction_goal -= released;
+	}
 }
 
 static void kv_eviction(uint64_t goal, void *opaque)
 {
 	struct kv_thread_data *ktd = KV_OPS_OPAQUE2KTD(opaque);
-	{ /* random eviction */
-		uint64_t released = 0, loopcnt = 0;
-		while (released < goal && loopcnt++ < 3 /* TODO: find an appropriate value */) {
-			uint64_t i;
-			for (i = 0; i < ____KV__CONF_HASH_TABLE_CNT; i++) {
-				{ /* xorshift64 */
-					ktd->random ^= ktd->random << 13;
-					ktd->random ^= ktd->random >> 7;
-					ktd->random ^= ktd->random << 17;
-				}
-				pthread_spin_lock(&lock[ktd->random % ____KV__CONF_HASH_TABLE_CNT]);
-				{
-					struct kv_item *head = hash_table[ktd->random % ____KV__CONF_HASH_TABLE_CNT];
-					if (head) {
-						struct kv_item *item = head;
-						while (item->next) item = item->next;
-						{
-							uint8_t cmd[MP_KV_CMD_SIZE];
-							memset(&cmd, 0, sizeof(cmd));
-							MP_KV_CMD_OPFLAGS(cmd) = MC_KV_CMD_OPFLAG_DELETE;
-							mp_ops_kv_cmd(NULL /* XXX: we are sure delete does not touch mpr */, item->data, item->key_len, cmd, opaque);
-						}
-						released += sizeof(struct kv_item) + item->key_len + item->val_len;
-					}
-				}
-				pthread_spin_unlock(&lock[ktd->random % ____KV__CONF_HASH_TABLE_CNT]);
-			}
-		}
-	}
+	ktd->eviction_goal = goal;
 }
 
 static int kv_register_ktd(struct kv_thread_data *ktd, uint64_t ktd_id)
