@@ -6,6 +6,16 @@ mimicached achieves [high performance](#rough-performance-numbers) by leveraging
 
 **WARNING: The authors will not bear any responsibility if the implementations, provided by the authors, cause any problems.**
 
+## how much and why is it fast?
+
+The graph below shows rough performance numbers of mimicached. The benchmark setup is described in [a section below](#rough-performance-numbers).
+
+<img src="https://raw.githubusercontent.com/yasukata/img/master/mimicached/github/head/throughput.svg" width="600px">
+
+The ```Limit of default TCP/IP stack``` and ```Limit of iip``` lines show the throughput results for a TCP pong-pong workload that exchanges 16-byte TCP messages as fast as possible and does not include the memcached-specific protocol parsing and key-value manipulation, and these throughput numbers indicate the throughput limits of the default TCP/IP stack of the kernel and iip, respectively.
+
+On one hand, the throughput of memcached is limited by the throughput limit of the default TCP/IP stack of the kernel. On the other hand, the throughput limit of iip is substantially higher than that of the default TCP/IP stack of the kernel; therefore, mimicached running on iip can achieve high throughput.
+
 ## usage
 
 ### build
