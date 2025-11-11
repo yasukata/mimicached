@@ -47,12 +47,11 @@ struct kv_thread_data {
 
 static struct kv_item **hash_table;
 static pthread_spinlock_t *lock;
-static uint64_t global_flush_time;
+static volatile uint64_t global_flush_time;
 
 static void mp_ops_kv_flush_all(uint64_t expr_sec, void *opaque)
 {
-	uint64_t expr = MP_OPS_UTIL_TIME_NS(opaque) + expr_sec * 1000000000UL;
-	KV_OPS_ATOMIC_LOAD(&expr, &global_flush_time, KV_FLAG_ATOMIC_ACQUIRE);
+	global_flush_time = MP_OPS_UTIL_TIME_NS(opaque) + expr_sec * 1000000000UL; /* XXX: lazy sync */
 }
 
 static void mp_ops_kv_cmd(void *mpr, const uint8_t *key, uint64_t key_len, uint8_t *cmd, void *opaque)
@@ -401,6 +400,7 @@ static int kv_register_ktd(struct kv_thread_data *ktd, uint64_t ktd_id)
 
 static void kv_init(void)
 {
+	global_flush_time = 0;
 	mp_assert(____KV__CONF_HASH_TABLE_CNT);
 	mp_assert(____KV__CONF_MAX_THREAD_NUM);
 	hash_table = (struct kv_item **) calloc(____KV__CONF_HASH_TABLE_CNT, sizeof(struct kv_item *));
