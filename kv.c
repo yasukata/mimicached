@@ -54,7 +54,7 @@ static void mp_ops_kv_flush_all(uint64_t expr_sec, void *opaque)
 	global_flush_time = MP_OPS_UTIL_TIME_NS(opaque) + expr_sec * 1000000000UL; /* XXX: lazy sync */
 }
 
-static void mp_ops_kv_cmd(void *mpr, const uint8_t *key, uint64_t key_len, uint8_t *cmd, void *opaque)
+static void mp_ops_kv_cmd(void *mpr, const uint8_t *key, uint64_t key_len, uint8_t *_cmd, void *opaque)
 {
 	struct kv_thread_data *ktd = KV_OPS_OPAQUE2KTD(opaque);
 	uint64_t hash, flush_time = global_flush_time /* XXX: lazy sync */, now = MP_OPS_UTIL_TIME_NS(opaque);
@@ -67,8 +67,16 @@ static void mp_ops_kv_cmd(void *mpr, const uint8_t *key, uint64_t key_len, uint8
 	}
 	pthread_spin_lock(&lock[hash % ____KV__CONF_HASH_TABLE_CNT]);
 	while (1) {
+		char retry_after_delete = 0;
+		uint8_t tmp_cmd[MP_KV_CMD_SIZE], *cmd = _cmd;
 		struct kv_item *item, *prev;
 		for (item = hash_table[hash % ____KV__CONF_HASH_TABLE_CNT], prev = NULL; item != NULL; item = item->next) {
+			if ((item->exptime && item->exptime < now) || (now > flush_time && item->add_time < flush_time)) {
+				retry_after_delete = 1;
+				cmd = tmp_cmd;
+				MP_KV_CMD_OPFLAGS(cmd) = MC_KV_CMD_OPFLAG_DELETE;
+				break;
+			}
 			if (key_len == item->key_len) {
 				if (!mp_memcmp(key, item->data, key_len))
 					break;
@@ -76,13 +84,6 @@ static void mp_ops_kv_cmd(void *mpr, const uint8_t *key, uint64_t key_len, uint8
 			prev = item;
 		}
 		if (item) {
-			char retry_after_delete = 0;
-			uint64_t cached_opflags = 0;
-			if ((item->exptime && item->exptime < now) || (now > flush_time && item->add_time < flush_time)) {
-				retry_after_delete = 1;
-				cached_opflags = MP_KV_CMD_OPFLAGS(cmd);
-				MP_KV_CMD_OPFLAGS(cmd) = MC_KV_CMD_OPFLAG_DELETE;
-			}
 			if (!retry_after_delete && (MP_KV_CMD_OPFLAGS(cmd) & MC_KV_CMD_OPFLAG_CAS) && (MP_KV_CMD_CAS_UNIQUE(cmd) != item->cas_unique)) {
 				MP_KV_CMD_OPFLAGS(cmd) |= MC_KV_CMD_OPFLAG_FOUND;
 				break; /* flag is not set */
@@ -93,13 +94,10 @@ static void mp_ops_kv_cmd(void *mpr, const uint8_t *key, uint64_t key_len, uint8
 				else
 					hash_table[hash % ____KV__CONF_HASH_TABLE_CNT] = item->next;
 				KV_OPS_SLAB_FREE(item, sizeof(struct kv_item) + item->key_len + item->val_len, opaque);
-				if (retry_after_delete) {
-					MP_KV_CMD_OPFLAGS(cmd) = cached_opflags;
+				if (retry_after_delete)
 					continue;
-				} else {
-					MP_KV_CMD_OPFLAGS(cmd) &= ~MC_KV_CMD_OPFLAG_DELETE;
-					MP_KV_CMD_OPFLAGS(cmd) |= MC_KV_CMD_OPFLAG_FOUND;
-				}
+				MP_KV_CMD_OPFLAGS(cmd) &= ~MC_KV_CMD_OPFLAG_DELETE;
+				MP_KV_CMD_OPFLAGS(cmd) |= MC_KV_CMD_OPFLAG_FOUND;
 			} else if (!item->exptime || (item->exptime && item->exptime > now)) {
 				uint8_t do_write = 0;
 				uint64_t ring_idx = MP_KV_CMD_VAL_PTR_0(cmd), ring_off = MP_KV_CMD_VAL_PTR_1(cmd); /* EXTRACT_DATA overwrites indexes, we preserve them for the case of retry */
