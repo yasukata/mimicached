@@ -16,6 +16,10 @@ The ```Limit of default TCP/IP stack``` and ```Limit of iip``` lines show the th
 
 On one hand, the throughput of memcached is limited by the throughput limit of the default TCP/IP stack of the kernel. On the other hand, the throughput limit of iip is substantially higher than that of the default TCP/IP stack of the kernel; therefore, mimicached running on iip can achieve high throughput.
 
+## jumpstart
+
+A start kit for Docker environments is found at [https://github.com/yasukata/jumpstart-on-docker#mimicached-on-dpdk](https://github.com/yasukata/jumpstart-on-docker#mimicached-on-dpdk). This would be useful for quickly checking how the program in this repository works.
+
 ## usage
 
 ### build
