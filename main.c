@@ -461,6 +461,7 @@ static void iip_ops_tcp_payload(void *mem, void *handle, void *m,
 				}
 			}
 			while (head_idx != MPR_RING_HEAD_IDX(o->mpr)) {
+				iip_tcp_rxbuf_consumed(mem, handle, MPR_SLOT_LEN(o->mpr, head_idx), opaque);
 				iip_ops_pkt_free(o->pbuf[head_idx], opaque);
 				head_idx++;
 				if (head_idx == NUM_MPR_SLOT)
@@ -479,7 +480,6 @@ static void iip_ops_tcp_payload(void *mem, void *handle, void *m,
 		}
 	}
 	td->o = NULL;
-	iip_tcp_rxbuf_consumed(mem, handle, 1, opaque);
 }
 
 static void iip_ops_tcp_acked(void *mem,
