@@ -1362,7 +1362,7 @@ static void iip_ops_tcp_payload(void *mem, void *handle, void *m,
 			}
 		}
 	}
-	iip_tcp_rxbuf_consumed(mem, handle, 1, opaque);
+	iip_tcp_rxbuf_consumed(mem, handle, PB_TCP_PAYLOAD_LEN(m) - head_off - tail_off, opaque);
 }
 
 static void __app_loop(void *mem, uint8_t mac[], uint32_t ip4_be, uint32_t *next_us, void *opaque)
