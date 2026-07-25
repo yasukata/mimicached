@@ -330,43 +330,44 @@ static void *__app_thread_init(void *workspace, uint16_t core_id, void *opaque)
 	}
 }
 
-static void iip_ops_arp_reply(void *_mem, void *m, void *opaque)
+static void iip_ops_arp_reply(void *_mem __attribute__((unused)), void *m, void *opaque)
 {
+	uint8_t hw_sender[6];
+	uint8_t ip4_sender[4];
+	memcpy(hw_sender, iip_ops_pkt_get_data(m, opaque) + iip_ops_l2_hdr_len(m, opaque) + sizeof(struct iip_arp_hdr), 6);
+	memcpy(ip4_sender, iip_ops_pkt_get_data(m, opaque) + iip_ops_l2_hdr_len(m, opaque) + sizeof(struct iip_arp_hdr) + 6, 4);
 	IIP_OPS_DEBUG_PRINTF("arp reply: %u.%u.%u.%u at %hhx:%hhx:%hhx:%hhx:%hhx:%hhx\n",
-			PB_ARP_IP_SENDER(m)[0],
-			PB_ARP_IP_SENDER(m)[1],
-			PB_ARP_IP_SENDER(m)[2],
-			PB_ARP_IP_SENDER(m)[3],
-			PB_ARP_HW_SENDER(m)[0],
-			PB_ARP_HW_SENDER(m)[1],
-			PB_ARP_HW_SENDER(m)[2],
-			PB_ARP_HW_SENDER(m)[3],
-			PB_ARP_HW_SENDER(m)[4],
-			PB_ARP_HW_SENDER(m)[5]
-	      );
-	{ /* unused */
-		(void) _mem;
-		(void) opaque;
-	}
+			ip4_sender[0], ip4_sender[1], ip4_sender[2], ip4_sender[3],
+			hw_sender[0], hw_sender[1], hw_sender[2], hw_sender[3], hw_sender[4], hw_sender[5]);
 }
 
-static void iip_ops_icmp_reply(void *_mem __attribute__((unused)), void *m __attribute__((unused)), void *opaque __attribute__((unused)))
+static void iip_ops_icmp_reply(void *_mem __attribute__((unused)), void *m, void *opaque)
 {
+	struct iip_ip4_hdr ip4h;
+	__iip_memcpy(&ip4h, iip_ops_pkt_get_data(m, opaque) + iip_ops_l2_hdr_len(m, opaque), sizeof(ip4h));
 	IIP_OPS_DEBUG_PRINTF("received icmp reply from %u.%u.%u.%u\n",
-			(PB_IP4(m)->dst_be >>  0) & 0xff,
-			(PB_IP4(m)->dst_be >>  8) & 0xff,
-			(PB_IP4(m)->dst_be >> 16) & 0xff,
-			(PB_IP4(m)->dst_be >> 24) & 0xff);
+			(ip4h.dst_be >>  0) & 0xff,
+			(ip4h.dst_be >>  8) & 0xff,
+			(ip4h.dst_be >> 16) & 0xff,
+			(ip4h.dst_be >> 24) & 0xff);
 }
 
 static uint8_t iip_ops_tcp_accept(void *mem __attribute__((unused)), void *m, void *opaque)
 {
 	void **opaque_array = (void **) opaque;
 	struct app_data *ad = (struct app_data *) opaque_array[1];
-	if (PB_TCP(m)->dst_be == ad->l4_port_be)
-		return 1;
-	else
-		return 0;
+	{
+		struct iip_ip4_hdr ip4h;
+		__iip_memcpy(&ip4h, iip_ops_pkt_get_data(m, opaque) + iip_ops_l2_hdr_len(m, opaque), sizeof(ip4h));
+		{
+			struct iip_tcp_hdr tcph;
+			__iip_memcpy(&tcph, iip_ops_pkt_get_data(m, opaque) + iip_ops_l2_hdr_len(m, opaque) + ((ip4h.vl & 0x0f) << 2), sizeof(tcph));
+			if (tcph.dst_be == ad->l4_port_be)
+				return 1;
+			else
+				return 0;
+		}
+	}
 }
 
 static void *iip_ops_tcp_accepted(void *mem __attribute__((unused)), void *handle, void *m __attribute__((unused)), void *opaque)
@@ -418,8 +419,16 @@ static void iip_ops_tcp_payload(void *mem, void *handle, void *m,
 	struct thread_data *td = (struct thread_data *) opaque_array[2];
 	struct tcp_opaque *o = (struct tcp_opaque *) tcp_opaque;
 	o->pbuf[MPR_RING_TAIL_IDX(o->mpr)] = iip_ops_pkt_clone(m, opaque);
-	MPR_SLOT_PTR(o->mpr, MPR_RING_TAIL_IDX(o->mpr)) = (uintptr_t) &(PB_TCP_PAYLOAD(o->pbuf[MPR_RING_TAIL_IDX(o->mpr)])[head_off]);
-	MPR_SLOT_LEN(o->mpr, MPR_RING_TAIL_IDX(o->mpr)) = PB_TCP_PAYLOAD_LEN(o->pbuf[MPR_RING_TAIL_IDX(o->mpr)]) - head_off - tail_off;
+	{
+		struct iip_ip4_hdr ip4h;
+		__iip_memcpy(&ip4h, iip_ops_pkt_get_data(m, opaque) + iip_ops_l2_hdr_len(m, opaque), sizeof(ip4h));
+		{
+			struct iip_tcp_hdr tcph;
+			__iip_memcpy(&tcph, iip_ops_pkt_get_data(m, opaque) + iip_ops_l2_hdr_len(m, opaque) + ((ip4h.vl & 0x0f) << 2), sizeof(tcph));
+			MPR_SLOT_PTR(o->mpr, MPR_RING_TAIL_IDX(o->mpr)) = ((uintptr_t) iip_ops_pkt_get_data(m, opaque) + iip_ops_l2_hdr_len(m, opaque) + ((ip4h.vl & 0x0f) << 2) + (((uint16_t) __iip_ntohs(tcph.flags) >> 12) << 2) + head_off);
+			MPR_SLOT_LEN(o->mpr, MPR_RING_TAIL_IDX(o->mpr)) = __iip_ntohs(ip4h.len_be) - ((ip4h.vl & 0x0f) << 2) - (((uint16_t) __iip_ntohs(tcph.flags) >> 12) << 2) - head_off - tail_off;
+		}
+	}
 	MPR_RING_TAIL_IDX(o->mpr)++;
 	if (MPR_RING_TAIL_IDX(o->mpr) == MPR_RING_NUM_SLOT(o->mpr))
 		MPR_RING_TAIL_IDX(o->mpr) = 0;
