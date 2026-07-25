@@ -1017,7 +1017,18 @@ static void *iip_ops_tcp_connected(void *mem, void *handle, void *m, void *opaqu
 		{
 			struct mc_td *mtd = (struct mc_td *) td->prev_arp;
 			{
-				uint16_t port = ntohs(PB_TCP(m)->dst_be);
+				uint16_t port;
+				{
+					struct iip_ip4_hdr ip4h;
+					__iip_memcpy(&ip4h, iip_ops_pkt_get_data(m, opaque) + iip_ops_l2_hdr_len(m, opaque), sizeof(ip4h));
+					{
+						struct iip_tcp_hdr tcph;
+						__iip_memcpy(&tcph, iip_ops_pkt_get_data(m, opaque) + iip_ops_l2_hdr_len(m, opaque) + ((ip4h.vl & 0x0f) << 2), sizeof(tcph));
+						{
+							port = ntohs(tcph.dst_be);
+						}
+					}
+				}
 				mtd->mcn[port] = mem_alloc_local(sizeof(struct mc_conn));
 				assert(mtd->mcn[port]);
 				mtd->mcn[port]->req_type = 0;
@@ -1171,198 +1182,215 @@ static void iip_ops_tcp_payload(void *mem, void *handle, void *m,
 	void **opaque_array = (void **) opaque;
 	struct thread_data *td = (struct thread_data *) opaque_array[2];
 	struct mc_td *mtd = (struct mc_td *) td->prev_arp;
-	uint16_t port = ntohs(PB_TCP(m)->dst_be);
-	uint8_t send_next = 0;
-	assert(sizeof(mtd->mcn[port]->rxbuf[mtd->mcn[port]->len] - mtd->mcn[port]->len > PB_TCP_PAYLOAD_LEN(m) - head_off - tail_off));
-	memcpy(&mtd->mcn[port]->rxbuf[mtd->mcn[port]->len], PB_TCP_PAYLOAD(m) + head_off, PB_TCP_PAYLOAD_LEN(m) - head_off - tail_off);
-	mtd->mcn[port]->len += PB_TCP_PAYLOAD_LEN(m) - head_off - tail_off;
-	mtd->mcn[port]->rxbuf[mtd->mcn[port]->len] = '\0';
-	td->monitor.counter[td->monitor.idx].rx_bytes += PB_TCP_PAYLOAD_LEN(m) - head_off - tail_off;
-	td->monitor.counter[td->monitor.idx].rx_pkt += 1;
 	{
-		uint64_t now = BENCH_IIP_NOW(opaque);
-		td->monitor.latency.val[td->monitor.latency.cnt++ % NUM_MONITOR_LATENCY_RECORD] = now - ((struct tcp_opaque *) tcp_opaque)->monitor.ts;
-		((struct tcp_opaque *) tcp_opaque)->monitor.ts = now;
-	}
-	while (mtd->mcn[port]->len) {
-		char found_error = 0;
-		if (mtd->mcn[port]->req_type == 2) {
-			if (mtd->mcn[port]->len >= 7 && mtd->mcn[port]->rxbuf[0] == 'E') {
-				if (!memcmp(mtd->mcn[port]->rxbuf, "ERROR\r\n", 7)) {
-					memmove(mtd->mcn[port]->rxbuf, &mtd->mcn[port]->rxbuf[7], mtd->mcn[port]->len - 7);
-					mtd->mcn[port]->len -= 7;
-					send_next = 1;
+		struct iip_ip4_hdr ip4h;
+		__iip_memcpy(&ip4h, iip_ops_pkt_get_data(m, opaque) + iip_ops_l2_hdr_len(m, opaque), sizeof(ip4h));
+		{
+			struct iip_tcp_hdr tcph;
+			__iip_memcpy(&tcph, iip_ops_pkt_get_data(m, opaque) + iip_ops_l2_hdr_len(m, opaque) + ((ip4h.vl & 0x0f) << 2), sizeof(tcph));
+			{
+				uint8_t *tcp_payload = (uint8_t *)((uintptr_t) iip_ops_pkt_get_data(m, opaque) + iip_ops_l2_hdr_len(m, opaque) + ((ip4h.vl & 0x0f) << 2) + (((uint16_t) __iip_ntohs(tcph.flags) >> 12) << 2) + head_off);
+				uint16_t tcp_payload_len = __iip_ntohs(ip4h.len_be) - ((ip4h.vl & 0x0f) << 2) - (((uint16_t) __iip_ntohs(tcph.flags) >> 12) << 2) - head_off - tail_off;
+				{
+					uint16_t port = ntohs(tcph.dst_be);
+					uint8_t send_next = 0;
+					assert(sizeof(mtd->mcn[port]->rxbuf[mtd->mcn[port]->len] - mtd->mcn[port]->len > tcp_payload_len));
+					memcpy(&mtd->mcn[port]->rxbuf[mtd->mcn[port]->len], tcp_payload, tcp_payload_len);
+					mtd->mcn[port]->len += tcp_payload_len;
+					mtd->mcn[port]->rxbuf[mtd->mcn[port]->len] = '\0';
+					td->monitor.counter[td->monitor.idx].rx_bytes += tcp_payload_len;
+					td->monitor.counter[td->monitor.idx].rx_pkt += 1;
 					{
-						uint8_t cid = mc_cnt_idx;
-						mtd->mcnt[cid].op[1].error++;
+						uint64_t now = BENCH_IIP_NOW(opaque);
+						td->monitor.latency.val[td->monitor.latency.cnt++ % NUM_MONITOR_LATENCY_RECORD] = now - ((struct tcp_opaque *) tcp_opaque)->monitor.ts;
+						((struct tcp_opaque *) tcp_opaque)->monitor.ts = now;
 					}
-					continue;
-				} else
-					found_error = 1;
-			} else if (mtd->mcn[port]->len >= 8 && mtd->mcn[port]->rxbuf[0] == 'S') {
-				if (!memcmp(mtd->mcn[port]->rxbuf, "STORED\r\n", 8)) {
-					memmove(mtd->mcn[port]->rxbuf, &mtd->mcn[port]->rxbuf[8], mtd->mcn[port]->len - 8);
-					mtd->mcn[port]->len -= 8;
-					send_next = 1;
-					{
-						uint8_t cid = mc_cnt_idx;
-						mtd->mcnt[cid].op[1].success++;
-					}
-					continue;
-				} else
-					found_error = 1;
-			} else
-				break;
-		} else if (mtd->mcn[port]->req_type == 1) {
-			if (mtd->mcn[port]->len >= 7 && mtd->mcn[port]->rxbuf[0] == 'E') {
-				if (!memcmp(mtd->mcn[port]->rxbuf, "ERROR\r\n", 7)) {
-					memmove(mtd->mcn[port]->rxbuf, &mtd->mcn[port]->rxbuf[7], mtd->mcn[port]->len - 7);
-					mtd->mcn[port]->len -= 7;
-					send_next = 1;
-					{
-						uint8_t cid = mc_cnt_idx;
-						mtd->mcnt[cid].op[0].error++;
-					}
-					continue;
-				} else
-					found_error = 1;
-			} else if (mtd->mcn[port]->len >= 5 && mtd->mcn[port]->rxbuf[0] == 'E') {
-				if (!memcmp(mtd->mcn[port]->rxbuf, "END\r\n", 5)) {
-					memmove(mtd->mcn[port]->rxbuf, &mtd->mcn[port]->rxbuf[5], mtd->mcn[port]->len - 5);
-					mtd->mcn[port]->len -= 5;
-					send_next = 1;
-					{
-						uint8_t cid = mc_cnt_idx;
-						mtd->mcnt[cid].op[0].failed++;
-					}
-					continue;
-				} else
-					found_error = 1;
-			} else if (mtd->mcn[port]->len >= 6 && mtd->mcn[port]->rxbuf[0] == 'V') {
-				if (!memcmp(mtd->mcn[port]->rxbuf, "VALUE ", 6)) {
-					uint64_t j;
-					int64_t word_cnt = 0, prev_space = 0, prev_r = 0, word_begin = 0;
-					for (j = 0; j < mtd->mcn[port]->len && !found_error; j++) {
-						switch (mtd->mcn[port]->rxbuf[j]) {
-						case ' ':
-							if (!prev_space)
-								word_cnt++;
-							prev_space = 1;
-							prev_r = 0;
-							break;
-						case '\r':
-							prev_space = 0;
-							prev_r = 1;
-							break;
-						case '\n':
-							if (prev_r) {
-								if (word_cnt == 3) {
-									uint64_t val_len;
-									mtd->mcn[port]->rxbuf[j-1] = '\0';
-									val_len = atol(&mtd->mcn[port]->rxbuf[word_begin]);
-									mtd->mcn[port]->rxbuf[j-1] = '\r';
-									if (mtd->mcn[port]->len >= j + 1 + val_len + 2 + 5) {
-										if (!memcmp(&mtd->mcn[port]->rxbuf[j + 1 + val_len + 2], "END\r\n", 5)) {
-											memmove(mtd->mcn[port]->rxbuf, &mtd->mcn[port]->rxbuf[j + 1 + val_len + 2 + 5], mtd->mcn[port]->len - (j + 1 + val_len + 2 + 5));
-											mtd->mcn[port]->len -= j + 1 + val_len + 2 + 5;
-											{
-												uint8_t cid = mc_cnt_idx;
-												mtd->mcnt[cid].op[0].success++;
+					while (mtd->mcn[port]->len) {
+						char found_error = 0;
+						if (mtd->mcn[port]->req_type == 2) {
+							if (mtd->mcn[port]->len >= 7 && mtd->mcn[port]->rxbuf[0] == 'E') {
+								if (!memcmp(mtd->mcn[port]->rxbuf, "ERROR\r\n", 7)) {
+									memmove(mtd->mcn[port]->rxbuf, &mtd->mcn[port]->rxbuf[7], mtd->mcn[port]->len - 7);
+									mtd->mcn[port]->len -= 7;
+									send_next = 1;
+									{
+										uint8_t cid = mc_cnt_idx;
+										mtd->mcnt[cid].op[1].error++;
+									}
+									continue;
+								} else
+									found_error = 1;
+							} else if (mtd->mcn[port]->len >= 8 && mtd->mcn[port]->rxbuf[0] == 'S') {
+								if (!memcmp(mtd->mcn[port]->rxbuf, "STORED\r\n", 8)) {
+									memmove(mtd->mcn[port]->rxbuf, &mtd->mcn[port]->rxbuf[8], mtd->mcn[port]->len - 8);
+									mtd->mcn[port]->len -= 8;
+									send_next = 1;
+									{
+										uint8_t cid = mc_cnt_idx;
+										mtd->mcnt[cid].op[1].success++;
+									}
+									continue;
+								} else
+									found_error = 1;
+							} else
+								break;
+						} else if (mtd->mcn[port]->req_type == 1) {
+							if (mtd->mcn[port]->len >= 7 && mtd->mcn[port]->rxbuf[0] == 'E') {
+								if (!memcmp(mtd->mcn[port]->rxbuf, "ERROR\r\n", 7)) {
+									memmove(mtd->mcn[port]->rxbuf, &mtd->mcn[port]->rxbuf[7], mtd->mcn[port]->len - 7);
+									mtd->mcn[port]->len -= 7;
+									send_next = 1;
+									{
+										uint8_t cid = mc_cnt_idx;
+										mtd->mcnt[cid].op[0].error++;
+									}
+									continue;
+								} else
+									found_error = 1;
+							} else if (mtd->mcn[port]->len >= 5 && mtd->mcn[port]->rxbuf[0] == 'E') {
+								if (!memcmp(mtd->mcn[port]->rxbuf, "END\r\n", 5)) {
+									memmove(mtd->mcn[port]->rxbuf, &mtd->mcn[port]->rxbuf[5], mtd->mcn[port]->len - 5);
+									mtd->mcn[port]->len -= 5;
+									send_next = 1;
+									{
+										uint8_t cid = mc_cnt_idx;
+										mtd->mcnt[cid].op[0].failed++;
+									}
+									continue;
+								} else
+									found_error = 1;
+							} else if (mtd->mcn[port]->len >= 6 && mtd->mcn[port]->rxbuf[0] == 'V') {
+								if (!memcmp(mtd->mcn[port]->rxbuf, "VALUE ", 6)) {
+									uint64_t j;
+									int64_t word_cnt = 0, prev_space = 0, prev_r = 0, word_begin = 0;
+									for (j = 0; j < mtd->mcn[port]->len && !found_error; j++) {
+										switch (mtd->mcn[port]->rxbuf[j]) {
+										case ' ':
+											if (!prev_space)
+												word_cnt++;
+											prev_space = 1;
+											prev_r = 0;
+											break;
+										case '\r':
+											prev_space = 0;
+											prev_r = 1;
+											break;
+										case '\n':
+											if (prev_r) {
+												if (word_cnt == 3) {
+													uint64_t val_len;
+													mtd->mcn[port]->rxbuf[j-1] = '\0';
+													val_len = atol(&mtd->mcn[port]->rxbuf[word_begin]);
+													mtd->mcn[port]->rxbuf[j-1] = '\r';
+													if (mtd->mcn[port]->len >= j + 1 + val_len + 2 + 5) {
+														if (!memcmp(&mtd->mcn[port]->rxbuf[j + 1 + val_len + 2], "END\r\n", 5)) {
+															memmove(mtd->mcn[port]->rxbuf, &mtd->mcn[port]->rxbuf[j + 1 + val_len + 2 + 5], mtd->mcn[port]->len - (j + 1 + val_len + 2 + 5));
+															mtd->mcn[port]->len -= j + 1 + val_len + 2 + 5;
+															{
+																uint8_t cid = mc_cnt_idx;
+																mtd->mcnt[cid].op[0].success++;
+															}
+															send_next = 1;
+															continue;
+														} else
+															found_error = 1;
+													}
+												} else
+													found_error = 1;
+												break;
 											}
-											send_next = 1;
-											continue;
-										} else
-											found_error = 1;
+											prev_space = 0;
+											prev_r = 0;
+											break;
+										default:
+											if (prev_space)
+												word_begin = j;
+											prev_space = 0;
+											prev_r = 0;
+											break;
+										}
 									}
 								} else
 									found_error = 1;
-								break;
+							} else
+								found_error = 1;
+						} else {
+							mtd->mcn[port]->len = 0;
+							send_next = 1;
+						}
+						if (found_error)
+							break;
+					}
+					if (send_next) {
+						char first_loading = 0;
+						if (mtd->load_first) {
+							uint64_t req_id = load_req_id++;
+							if (req_id < mtd->num_pairs) {
+								mtd->mcn[port]->req_type = 2;
+								send_set_request(req_id, mem, handle, opaque);
+								first_loading = 1;
+							} else {
+								if (req_id == mtd->num_pairs)
+									printf("%lu items has been loaded\n", mtd->num_pairs);
+								mtd->load_first = 0;
 							}
-							prev_space = 0;
-							prev_r = 0;
-							break;
-						default:
-							if (prev_space)
-								word_begin = j;
-							prev_space = 0;
-							prev_r = 0;
-							break;
+						}
+						if (!first_loading && !mtd->load_first) {
+							uint64_t req_id;
+							RANDOM_XORSHIFT64(mtd->random);
+							if (mtd->dist_zipfian) {
+								double u, uz;
+								u = (((double) mtd->random) / UINT64_MAX);
+								uz = u * mtd->zipfian.zetan;
+								if (uz < 1)
+									req_id = 0; /* base */
+								else if (uz < 1 + pow(0.5, mtd->zipfian.theta))
+									req_id = 0 /* base */ + 1;
+								else
+									req_id = 0 /* base */ + (long)(mtd->num_pairs * pow(mtd->zipfian.eta * u - mtd->zipfian.eta + 1, mtd->zipfian.alpha));
+							} else
+								req_id = mtd->random % mtd->num_pairs;
+							RANDOM_XORSHIFT64(mtd->random);
+							if ((mtd->random % 100) < mtd->write_ratio) {
+								mtd->mcn[port]->req_type = 2;
+								send_set_request(req_id, mem, handle, opaque);
+							} else {
+								mtd->mcn[port]->req_type = 1;
+								{
+									uint64_t l = 0;
+									while (l < mtd->get_req_len) {
+										void *p = iip_ops_pkt_alloc(opaque);
+										assert(p);
+										{
+											uint64_t _l = mtd->get_req_len;
+											if (_l > ANTICIPATED_PKT_BUF_LEN)
+												_l = ANTICIPATED_PKT_BUF_LEN;
+											memcpy(iip_ops_pkt_get_data(p, opaque), &mtd->get_req_base[l], _l);
+											if (!l) {
+												char key[250];
+												assert(_l > 4 + mtd->key_len); /* XXX: lazy check */
+												snprintf(key, sizeof(key), mtd->key_base, req_id);
+												memcpy(iip_ops_pkt_get_data(p, opaque) + 4, key, mtd->key_len);
+											}
+											iip_ops_pkt_set_len(p, _l, opaque);
+											iip_tcp_send(mem, handle, p, 0x08U, opaque);
+											td->monitor.counter[td->monitor.idx].tx_bytes += _l;
+											td->monitor.counter[td->monitor.idx].tx_pkt += 1;
+											l += _l;
+										}
+									}
+								}
+							}
 						}
 					}
-				} else
-					found_error = 1;
-			} else
-				found_error = 1;
-		} else {
-			mtd->mcn[port]->len = 0;
-			send_next = 1;
-		}
-		if (found_error)
-			break;
-	}
-	if (send_next) {
-		char first_loading = 0;
-		if (mtd->load_first) {
-			uint64_t req_id = load_req_id++;
-			if (req_id < mtd->num_pairs) {
-				mtd->mcn[port]->req_type = 2;
-				send_set_request(req_id, mem, handle, opaque);
-				first_loading = 1;
-			} else {
-				if (req_id == mtd->num_pairs)
-					printf("%lu items has been loaded\n", mtd->num_pairs);
-				mtd->load_first = 0;
-			}
-		}
-		if (!first_loading && !mtd->load_first) {
-			uint64_t req_id;
-			RANDOM_XORSHIFT64(mtd->random);
-			if (mtd->dist_zipfian) {
-				double u, uz;
-				u = (((double) mtd->random) / UINT64_MAX);
-				uz = u * mtd->zipfian.zetan;
-				if (uz < 1)
-					req_id = 0; /* base */
-				else if (uz < 1 + pow(0.5, mtd->zipfian.theta))
-					req_id = 0 /* base */ + 1;
-				else
-					req_id = 0 /* base */ + (long)(mtd->num_pairs * pow(mtd->zipfian.eta * u - mtd->zipfian.eta + 1, mtd->zipfian.alpha));
-			} else
-				req_id = mtd->random % mtd->num_pairs;
-			RANDOM_XORSHIFT64(mtd->random);
-			if ((mtd->random % 100) < mtd->write_ratio) {
-				mtd->mcn[port]->req_type = 2;
-				send_set_request(req_id, mem, handle, opaque);
-			} else {
-				mtd->mcn[port]->req_type = 1;
-				{
-					uint64_t l = 0;
-					while (l < mtd->get_req_len) {
-						void *p = iip_ops_pkt_alloc(opaque);
-						assert(p);
-						{
-							uint64_t _l = mtd->get_req_len;
-							if (_l > ANTICIPATED_PKT_BUF_LEN)
-								_l = ANTICIPATED_PKT_BUF_LEN;
-							memcpy(iip_ops_pkt_get_data(p, opaque), &mtd->get_req_base[l], _l);
-							if (!l) {
-								char key[250];
-								assert(_l > 4 + mtd->key_len); /* XXX: lazy check */
-								snprintf(key, sizeof(key), mtd->key_base, req_id);
-								memcpy(iip_ops_pkt_get_data(p, opaque) + 4, key, mtd->key_len);
-							}
-							iip_ops_pkt_set_len(p, _l, opaque);
-							iip_tcp_send(mem, handle, p, 0x08U, opaque);
-							td->monitor.counter[td->monitor.idx].tx_bytes += _l;
-							td->monitor.counter[td->monitor.idx].tx_pkt += 1;
-							l += _l;
-						}
-					}
+					iip_tcp_rxbuf_consumed(mem, handle, tcp_payload_len, opaque);
 				}
 			}
 		}
 	}
-	iip_tcp_rxbuf_consumed(mem, handle, PB_TCP_PAYLOAD_LEN(m) - head_off - tail_off, opaque);
+	{ /* unused */
+		(void) __o_iip_ops_tcp_payload;
+	}
 }
 
 static void __app_loop(void *mem, uint8_t mac[], uint32_t ip4_be, uint32_t *next_us, void *opaque)
@@ -1508,7 +1536,7 @@ static void *__app_init(int argc, char *const *argv)
 In ```mimicached/network-benchmark```, please type the following command to build the benchmark client; we will have a executable binary named ```a.out```.
 
 ```
-APP_EXTRA_LDFLAGS="-lm" IOSUB_DIR=../iip-dpdk make -f ../Makefile
+APP_EXTRA_CFLAGS="-I./" APP_EXTRA_LDFLAGS="-lm" IOSUB_DIR=../iip-af_xdp make -f ../Makefile
 ```
 
 To check the behavior of this benchmark client on a single host, we assume [mimicached with the kernel TCP/IP stack](#mimicached-with-the-kernel-tcpip-stack) has been launched beforehand.
