@@ -241,7 +241,7 @@ static long ii_call_pkt_data_write(IIP_PKT_P pkt, const uint8_t *buf, IIP_PKT_LE
 static int ii_call_pkt_set_len(IIP_PKT_P pkt, IIP_PKT_LEN_T len, IIP_OPAQUE_P opaque);
 
 static enum iip_rc ii_pb_tcp_payload_len(IIP_MEM_P w, II_PB_P pb_id, IIP_PKT_LEN_T *payload_len);
-static enum iip_rc ii_pb_payload_copy(IIP_MEM_P w, II_PB_P pb_id, IIP_PKT_LEN_T skip, uint8_t *buf, IIP_PKT_LEN_T buf_len, IIP_PKT_LEN_T *copied_len, IIP_OPAQUE_P opaque);
+static enum iip_rc ii_pb_ipv4_payload_copy(IIP_MEM_P w, II_PB_P pb_id, IIP_PKT_LEN_T skip, uint8_t *buf, IIP_PKT_LEN_T buf_len, IIP_PKT_LEN_T *copied_len, IIP_OPAQUE_P opaque);
 
 static void mp_ops_clear_response(void *opaque)
 {
@@ -360,28 +360,16 @@ static void *__app_thread_init(void *workspace, uint16_t core_id, void *opaque)
 static uint8_t ii_extract_ipv4_hdr_len(const uint8_t *buf);
 static uint16_t ii_read_uint16(const uint8_t *buf);
 
-static bool iip_ops_tcp_accept(IIP_MEM_P w, II_PB_P pb_id, IIP_OPAQUE_P opaque)
+static bool iip_ops_tcp_accept(uint8_t *tcp_hdr, IIP_OPAQUE_P opaque)
 {
-	uint8_t tcp_hdr[II_TCP_HDR_LEN_MINIMAL];
-	IIP_PKT_LEN_T copied_len;
-	{
-		if (ii_pb_payload_copy(w, pb_id, II_ETH_HDR_LEN + ii_extract_ipv4_hdr_len(II_PB(pb_id).part_pkt[0].l3), tcp_hdr, II_TCP_HDR_LEN_MINIMAL, &copied_len, opaque) != IIP_ERR_OK) {
-			assert(0);
-		}
-		if (copied_len != II_TCP_HDR_LEN_MINIMAL) {
-			assert(0);
-		}
-	}
-	{
-		void **opaque_array = (void **) opaque;
-		struct app_data *ad = (struct app_data *) opaque_array[1];
-		if (ii_read_uint16(&tcp_hdr[2]) == ad->l4_port_be)
-			return true;
-		else
-			return false;
-	}
+	void **opaque_array = (void **) opaque;
+	struct app_data *ad = (struct app_data *) opaque_array[1];
+	if (ii_read_uint16(&tcp_hdr[2]) == ad->l4_port_be)
+		return true;
+	else
+		return false;
 }
-#define IIP_OPS_TCP_ACCEPT() do { iip_ret_bool = iip_ops_tcp_accept(w, pb_id, opaque); } while (0)
+#define IIP_OPS_TCP_ACCEPT() do { iip_ret_bool = iip_ops_tcp_accept(tcp_hdr, opaque); } while (0)
 
 static IIP_TCP_OPAQUE_P iip_ops_tcp_accepted(IIP_MEM_P w, IIP_TCP_CONN_P conn_id, IIP_OPAQUE_P opaque)
 {
@@ -425,7 +413,7 @@ static int iip_ops_tcp_payload(IIP_MEM_P w, IIP_TCP_CONN_P conn_id, II_PB_P pb_i
 		MPR_SLOT_PTR(o->mpr, MPR_RING_TAIL_IDX(o->mpr)) = (uintptr_t) o->rx_buf[MPR_RING_TAIL_IDX(o->mpr)];
 		{
 			IIP_PKT_LEN_T copied_len;
-			if (ii_pb_payload_copy(w, pb_id, II_ETH_HDR_LEN + ii_extract_ipv4_hdr_len(II_PB(pb_id).part_pkt[0].l3) + ii_pb_tcp_hdr_len(w, pb_id) + II_PB(pb_id).tcp.inc_head, (uint8_t *) MPR_SLOT_PTR(o->mpr, MPR_RING_TAIL_IDX(o->mpr)), MPR_SLOT_LEN(o->mpr, MPR_RING_TAIL_IDX(o->mpr)), &copied_len, opaque) != IIP_ERR_OK) {
+			if (ii_pb_ipv4_payload_copy(w, pb_id, ii_pb_tcp_hdr_len(w, pb_id) + II_PB(pb_id).tcp.inc_head, (uint8_t *) MPR_SLOT_PTR(o->mpr, MPR_RING_TAIL_IDX(o->mpr)), MPR_SLOT_LEN(o->mpr, MPR_RING_TAIL_IDX(o->mpr)), &copied_len, opaque) != IIP_ERR_OK) {
 				assert(0);
 			}
 			if (MPR_SLOT_LEN(o->mpr, MPR_RING_TAIL_IDX(o->mpr)) != copied_len) {
